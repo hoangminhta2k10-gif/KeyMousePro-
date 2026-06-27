@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">KeyMousePro</string>
+    <string name="accessibility_description">
+        KeyMousePro theo dõi ứng dụng đang chạy để tự động
+        chuyển profile phím phù hợp với từng game.
+    </string>
+</resources>
