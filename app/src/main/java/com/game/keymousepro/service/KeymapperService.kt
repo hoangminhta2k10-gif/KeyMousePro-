@@ -230,8 +230,11 @@ class KeymapperService : Service() {
     // ════════ ADB ════════
 
     private suspend fun connectAdb() {
-        updateNotif("📡 Đang kết nối ADB...")
-        val ok = adb.connect("127.0.0.1", 5555)
+    val prefs = getSharedPreferences("service_prefs", MODE_PRIVATE)
+    val ip = prefs.getString("adb_ip", "127.0.0.1") ?: "127.0.0.1"
+    val port = prefs.getInt("adb_port", 5555)
+    updateNotif("📡 Đang kết nối $ip:$port ...")
+    val ok = adb.connect(ip, port)
         if (ok) {
             updateNotif("✓ ADB OK — Cắm chuột/bàn phím USB")
             overlayMgr.show()
