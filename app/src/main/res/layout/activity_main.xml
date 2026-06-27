@@ -3,7 +3,7 @@
     xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#080810">
+    android:background="#0a0a1e">
 
     <LinearLayout
         android:layout_width="match_parent"
@@ -11,208 +11,224 @@
         android:orientation="vertical"
         android:padding="20dp">
 
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="🎮 KeyMousePro"
-            android:textColor="#00e676"
-            android:textSize="22sp"
-            android:textStyle="bold"
-            android:layout_marginBottom="4dp"/>
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="Gaming Peripheral Manager"
-            android:textColor="#55556a"
-            android:textSize="12sp"
-            android:layout_marginBottom="20dp"/>
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="PHƯƠNG THỨC KẾT NỐI"
-            android:textColor="#33334a"
-            android:textSize="10sp"
-            android:layout_marginBottom="8dp"/>
-
-        <RadioGroup
-            android:id="@+id/rgMode"
+        <!-- Header -->
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
-            android:layout_marginBottom="16dp">
+            android:gravity="center_vertical"
+            android:layout_marginBottom="24dp">
 
-            <RadioButton
-                android:id="@+id/rbTcp"
+            <TextView
                 android:layout_width="0dp"
-                android:layout_height="48dp"
+                android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:text="🔌 ADB TCP"
-                android:textColor="#eeeeff"
-                android:buttonTint="#00e676"
-                android:checked="true"/>
+                android:text="🎮 KeyMousePro"
+                android:textColor="#00e676"
+                android:textSize="22sp"
+                android:textStyle="bold"/>
 
-            <RadioButton
-                android:id="@+id/rbWireless"
-                android:layout_width="0dp"
-                android:layout_height="48dp"
-                android:layout_weight="1"
-                android:text="📶 Không dây"
-                android:textColor="#eeeeff"
-                android:buttonTint="#448aff"/>
-
-        </RadioGroup>
-
-        <TextView
-            android:id="@+id/tvGuide"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:background="#0d0d20"
-            android:padding="12dp"
-            android:textColor="#6677aa"
-            android:textSize="12sp"
-            android:lineSpacingExtra="4dp"
-            android:layout_marginBottom="16dp"/>
-
-        <!-- TCP Section -->
-        <LinearLayout
-            android:id="@+id/layoutTcp"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="vertical">
-
-            <EditText
-                android:id="@+id/etTcpIp"
-                android:layout_width="match_parent"
-                android:layout_height="52dp"
-                android:hint="IP (mặc định: 127.0.0.1)"
-                android:inputType="text"
-                android:textColor="#eeeeff"
-                android:textColorHint="#33334a"
-                android:backgroundTint="#1c1c2e"
-                android:layout_marginBottom="8dp"/>
-
-            <EditText
-                android:id="@+id/etTcpPort"
-                android:layout_width="match_parent"
-                android:layout_height="52dp"
-                android:hint="Port (mặc định: 5555)"
-                android:inputType="number"
-                android:textColor="#eeeeff"
-                android:textColorHint="#33334a"
-                android:backgroundTint="#1c1c2e"
-                android:layout_marginBottom="16dp"/>
+            <TextView
+                android:id="@+id/tvBadge"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="● Chưa kết nối"
+                android:textColor="#ff1744"
+                android:textSize="11sp"
+                android:background="#1c1c2e"
+                android:paddingStart="10dp"
+                android:paddingEnd="10dp"
+                android:paddingTop="4dp"
+                android:paddingBottom="4dp"/>
 
         </LinearLayout>
 
-        <!-- Wireless Section -->
+        <!-- BƯỚC 1: Quyền -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="BƯỚC 1 — CẤP QUYỀN"
+            android:textColor="#00e676"
+            android:textSize="10sp"
+            android:textStyle="bold"
+            android:letterSpacing="0.1"
+            android:layout_marginBottom="10dp"/>
+
         <LinearLayout
-            android:id="@+id/layoutWireless"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
-            android:visibility="gone">
+            android:background="#10102a"
+            android:padding="14dp"
+            android:layout_marginBottom="20dp">
 
-            <EditText
-                android:id="@+id/etPairIp"
+            <!-- Overlay -->
+            <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="52dp"
-                android:hint="IP thiết bị (VD: 192.168.1.5)"
-                android:inputType="text"
-                android:textColor="#eeeeff"
-                android:textColorHint="#33334a"
-                android:backgroundTint="#1c1c2e"
-                android:layout_marginBottom="8dp"/>
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginBottom="10dp">
 
-            <EditText
-                android:id="@+id/etPairPort"
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="🪟  Quyền cửa sổ nổi"
+                    android:textColor="#eef0ff"
+                    android:textSize="14sp"/>
+
+                <Button
+                    android:id="@+id/btnGrantOverlay"
+                    android:layout_width="wrap_content"
+                    android:layout_height="36dp"
+                    android:text="CẤP QUYỀN"
+                    android:textSize="11sp"
+                    android:textColor="#000000"
+                    android:backgroundTint="#00e676"/>
+
+            </LinearLayout>
+
+            <!-- Background -->
+            <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="52dp"
-                android:hint="Port ghép nối (từ màn hình Wireless Debugging)"
-                android:inputType="number"
-                android:textColor="#eeeeff"
-                android:textColorHint="#33334a"
-                android:backgroundTint="#1c1c2e"
-                android:layout_marginBottom="8dp"/>
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
 
-            <EditText
-                android:id="@+id/etPairCode"
-                android:layout_width="match_parent"
-                android:layout_height="52dp"
-                android:hint="Mã ghép nối 6 số"
-                android:inputType="number"
-                android:textColor="#eeeeff"
-                android:textColorHint="#33334a"
-                android:backgroundTint="#1c1c2e"
-                android:layout_marginBottom="12dp"/>
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="⚡  Quyền chạy nền"
+                    android:textColor="#eef0ff"
+                    android:textSize="14sp"/>
 
-            <Button
-                android:id="@+id/btnPair"
-                android:layout_width="match_parent"
-                android:layout_height="52dp"
-                android:text="🔑 Ghép nối"
-                android:textColor="#000000"
-                android:backgroundTint="#448aff"
-                android:layout_marginBottom="16dp"/>
+                <Button
+                    android:id="@+id/btnGrantBattery"
+                    android:layout_width="wrap_content"
+                    android:layout_height="36dp"
+                    android:text="CẤP QUYỀN"
+                    android:textSize="11sp"
+                    android:textColor="#000000"
+                    android:backgroundTint="#00e676"/>
 
-            <View
-                android:layout_width="match_parent"
-                android:layout_height="1dp"
-                android:background="#1c1c2e"
-                android:layout_marginBottom="12dp"/>
-
-            <EditText
-                android:id="@+id/etConnPort"
-                android:layout_width="match_parent"
-                android:layout_height="52dp"
-                android:hint="Port kết nối (từ màn hình Wireless Debugging)"
-                android:inputType="number"
-                android:textColor="#eeeeff"
-                android:textColorHint="#33334a"
-                android:backgroundTint="#1c1c2e"
-                android:layout_marginBottom="16dp"/>
+            </LinearLayout>
 
         </LinearLayout>
 
+        <!-- BƯỚC 2: Hướng dẫn -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="BƯỚC 2 — BẬT WIRELESS DEBUGGING"
+            android:textColor="#00e676"
+            android:textSize="10sp"
+            android:textStyle="bold"
+            android:letterSpacing="0.1"
+            android:layout_marginBottom="10dp"/>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="#10102a"
+            android:padding="14dp"
+            android:layout_marginBottom="20dp">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="1. Vào Cài đặt → Giới thiệu về điện thoại\n   → Nhấn 7 lần vào Số hiệu bản dựng\n\n2. Quay lại Cài đặt → Tùy chọn nhà phát triển\n\n3. Bật Gỡ lỗi không dây (Wireless Debugging)\n\n4. Mở Wireless Debugging → Ghi nhớ số Port\n   (VD: Địa chỉ IP và cổng: 192.168.1.5:38721\n    → Port cần nhập là: 38721)"
+                android:textColor="#6677aa"
+                android:textSize="13sp"
+                android:lineSpacingExtra="3dp"
+                android:layout_marginBottom="12dp"/>
+
+            <Button
+                android:id="@+id/btnOpenDevOptions"
+                android:layout_width="match_parent"
+                android:layout_height="44dp"
+                android:text="⚙️ Mở Tùy chọn nhà phát triển"
+                android:textColor="#448aff"
+                android:textSize="12sp"
+                android:backgroundTint="#141436"/>
+
+        </LinearLayout>
+
+        <!-- BƯỚC 3: Nhập port -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="BƯỚC 3 — NHẬP PORT VÀ KẾT NỐI"
+            android:textColor="#00e676"
+            android:textSize="10sp"
+            android:textStyle="bold"
+            android:letterSpacing="0.1"
+            android:layout_marginBottom="10dp"/>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="#10102a"
+            android:padding="14dp"
+            android:layout_marginBottom="20dp">
+
+            <EditText
+                android:id="@+id/etPort"
+                android:layout_width="match_parent"
+                android:layout_height="52dp"
+                android:hint="Nhập Port từ màn hình Wireless Debugging"
+                android:inputType="number"
+                android:textColor="#eef0ff"
+                android:textColorHint="#33334a"
+                android:textSize="15sp"
+                android:backgroundTint="#1c1c2e"
+                android:layout_marginBottom="8dp"/>
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="💡 Kết nối lần đầu: Sẽ hiện hộp thoại 'Cho phép gỡ lỗi qua USB' → Nhấn Cho phép → App tự kết nối lại"
+                android:textColor="#33334a"
+                android:textSize="11sp"
+                android:layout_marginBottom="14dp"/>
+
+            <Button
+                android:id="@+id/btnConnect"
+                android:layout_width="match_parent"
+                android:layout_height="54dp"
+                android:text="🔗  Kết nối ADB"
+                android:textColor="#000000"
+                android:textStyle="bold"
+                android:textSize="15sp"
+                android:backgroundTint="#00e676"/>
+
+        </LinearLayout>
+
+        <!-- Status Box -->
         <TextView
             android:id="@+id/tvStatus"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="● Chưa kết nối"
-            android:textColor="#ff1744"
-            android:textSize="13sp"
-            android:padding="10dp"
-            android:background="#0d0d20"
+            android:text="Chờ kết nối..."
+            android:textColor="#6677aa"
+            android:textSize="12sp"
+            android:background="#10102a"
+            android:padding="14dp"
+            android:lineSpacingExtra="4dp"
             android:layout_marginBottom="16dp"/>
 
+        <!-- Gaming Mode Button -->
         <Button
-            android:id="@+id/btnConnect"
+            android:id="@+id/btnGaming"
             android:layout_width="match_parent"
-            android:layout_height="56dp"
-            android:text="🔗 Kết nối ADB"
+            android:layout_height="60dp"
+            android:text="▶  Bắt đầu Gaming Mode"
             android:textColor="#000000"
             android:textStyle="bold"
-            android:backgroundTint="#00e676"
-            android:layout_marginBottom="8dp"/>
-
-        <Button
-            android:id="@+id/btnDisconnect"
-            android:layout_width="match_parent"
-            android:layout_height="56dp"
-            android:text="⏹ Ngắt kết nối"
-            android:textColor="#ff1744"
-            android:backgroundTint="#1c1c2e"
-            android:visibility="gone"
-            android:layout_marginBottom="8dp"/>
-
-        <Button
-            android:id="@+id/btnStartService"
-            android:layout_width="match_parent"
-            android:layout_height="56dp"
-            android:text="▶ Bắt đầu Gaming Mode"
-            android:textColor="#000000"
-            android:textStyle="bold"
+            android:textSize="16sp"
             android:backgroundTint="#7c4dff"
             android:enabled="false"/>
 
