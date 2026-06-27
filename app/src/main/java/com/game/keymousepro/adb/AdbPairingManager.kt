@@ -6,10 +6,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.ConnectException
+import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.security.KeyPairGenerator
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import javax.crypto.Mac
@@ -26,16 +28,58 @@ class AdbPairingManager(private val context: Context) {
         private const val PEER_TYPE_HOST = 1.toByte()
     }
 
+    // ── Result types ──
+    sealed class PairResult {
+        object Success : PairResult()
+        object WrongCode : PairResult()
+        object Timeout : PairResult()
+        data class ConnectionFailed(val reason: String) : PairResult()
+        data class Error(val message: String) : PairResult()
+    }
+
+    // ── Pair with result type ──
+    suspend fun pairWithResult(host: String, port: Int, pairingCode: String): PairResult {
+        return withContext(Dispatchers.IO) {
+            try {
+                Log.d(TAG, "→ Ghép nối $host:$port")
+                val success = pair(host, port, pairingCode)
+                if (success) {
+                    Log.d(TAG, "✅ Ghép nối thành công")
+                    PairResult.Success
+                } else {
+                    Log.w(TAG, "Ghép nối thất bại - sai mã")
+                    PairResult.WrongCode
+                }
+            } catch (e: SocketTimeoutException) {
+                Log.e(TAG, "Timeout: ${e.message}")
+                PairResult.Timeout
+            } catch (e: ConnectException) {
+                Log.e(TAG, "Kết nối thất bại: ${e.message}")
+                PairResult.ConnectionFailed(
+                    "Không thể kết nối tới $host:$port\n" +
+                    "Kiểm tra:\n• IP đúng chưa?\n• Port ghép nối đúng chưa?\n• Wireless Debugging đang bật?"
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Lỗi: ${e.message}")
+                PairResult.Error(e.message ?: "Lỗi không xác định")
+            }
+        }
+    }
+
+    // ── Pair implementation ──
     suspend fun pair(host: String, port: Int, pairingCode: String): Boolean {
         return withContext(Dispatchers.IO) {
+            var sslSocket: SSLSocket? = null
             try {
                 val sslContext = SSLContext.getInstance("TLSv1.3").apply {
                     init(null, arrayOf(TrustAllManager()), SecureRandom())
                 }
 
-                val sslSocket = (sslContext.socketFactory
-                    .createSocket(host, port) as SSLSocket)
+                sslSocket = sslContext.socketFactory.createSocket() as SSLSocket
+                sslSocket.connect(InetSocketAddress(host, port), 10000)
                 sslSocket.startHandshake()
+
+                Log.d(TAG, "TLS handshake OK")
 
                 val ins = sslSocket.inputStream
                 val outs = sslSocket.outputStream
@@ -47,21 +91,20 @@ class AdbPairingManager(private val context: Context) {
                 val clientShare = computeClientShare(clientNonce, password)
                 sendMsg(outs, TYPE_SPAKE2, clientShare)
 
-                val serverShare = receiveMsg(ins) ?: run {
-                    sslSocket.close(); return@withContext false
-                }
+                val serverShare = receiveMsg(ins)
+                    ?: return@withContext false
 
                 val sharedKey = computeSharedKey(clientNonce, serverShare, password)
                 val clientEvidence = computeEvidence(sharedKey, isClient = true)
                 sendMsg(outs, TYPE_SPAKE2, clientEvidence)
 
-                val serverEvidence = receiveMsg(ins) ?: run {
-                    sslSocket.close(); return@withContext false
-                }
+                val serverEvidence = receiveMsg(ins)
+                    ?: return@withContext false
 
                 val expectedEvidence = computeEvidence(sharedKey, isClient = false)
                 if (!serverEvidence.contentEquals(expectedEvidence)) {
-                    sslSocket.close(); return@withContext false
+                    Log.e(TAG, "Mã ghép nối sai")
+                    return@withContext false
                 }
 
                 val peerInfo = "KeyMousePro".toByteArray(Charsets.UTF_8)
@@ -71,11 +114,13 @@ class AdbPairingManager(private val context: Context) {
                 sendMsg(outs, TYPE_PEER_INFO, peerInfoMsg)
                 receiveMsg(ins)
 
-                sslSocket.close()
                 true
+
             } catch (e: Exception) {
                 Log.e(TAG, "Lỗi ghép nối: ${e.message}")
-                false
+                throw e
+            } finally {
+                try { sslSocket?.close() } catch (_: Exception) {}
             }
         }
     }
@@ -95,7 +140,8 @@ class AdbPairingManager(private val context: Context) {
     ): ByteArray {
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(SecretKeySpec(password, "HmacSHA256"))
-        mac.update(clientNonce); mac.update(serverShare)
+        mac.update(clientNonce)
+        mac.update(serverShare)
         return mac.doFinal()
     }
 
@@ -109,9 +155,13 @@ class AdbPairingManager(private val context: Context) {
     private fun sendMsg(out: OutputStream, type: Byte, data: ByteArray) {
         val buf = ByteBuffer.allocate(6 + data.size).apply {
             order(ByteOrder.BIG_ENDIAN)
-            putInt(data.size); put(MSG_VERSION); put(type); put(data)
+            putInt(data.size)
+            put(MSG_VERSION)
+            put(type)
+            put(data)
         }
-        out.write(buf.array()); out.flush()
+        out.write(buf.array())
+        out.flush()
     }
 
     private fun receiveMsg(ins: InputStream): ByteArray? {
