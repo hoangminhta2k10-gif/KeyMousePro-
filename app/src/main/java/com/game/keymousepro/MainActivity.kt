@@ -2,7 +2,6 @@ package com.game.keymousepro
 
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.widget.Button
@@ -26,8 +25,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnConnect     : Button
     private lateinit var btnGaming      : Button
 
-    private var isConnected = false
-    private var adb: AdbConnectionManager? = null
+    private var isConnected  = false
+    private var retryJob     : Job? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -36,10 +35,9 @@ class MainActivity : AppCompatActivity() {
         setupListeners()
         checkPermissions()
 
-        // Khôi phục port đã lưu
-        val savedPort = getSharedPreferences("kmp", MODE_PRIVATE)
+        val saved = getSharedPreferences("kmp", MODE_PRIVATE)
             .getString("port", "") ?: ""
-        if (savedPort.isNotEmpty()) etPort.setText(savedPort)
+        if (saved.isNotEmpty()) etPort.setText(saved)
     }
 
     private fun bindViews() {
@@ -55,7 +53,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun setupListeners() {
 
-        // Cấp quyền Overlay
         btnGrantOverlay.setOnClickListener {
             startActivity(
                 Intent(
@@ -65,54 +62,60 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
-        // Cấp quyền chạy nền (bỏ tối ưu pin)
         btnGrantBattery.setOnClickListener {
             try {
-                val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                    data = Uri.parse("package:$packageName")
-                }
-                startActivity(intent)
+                startActivity(
+                    Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                )
             } catch (e: Exception) {
-                // Fallback: mở cài đặt pin
                 startActivity(Intent(Settings.ACTION_BATTERY_SAVER_SETTINGS))
             }
         }
 
-        // Mở Tùy chọn nhà phát triển
         btnOpenDev.setOnClickListener {
+            // Mở thẳng Tùy chọn nhà phát triển
             try {
-                startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
+                startActivity(
+                    Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)
+                )
             } catch (e: Exception) {
                 startActivity(Intent(Settings.ACTION_SETTINGS))
             }
         }
 
-        // Kết nối ADB
         btnConnect.setOnClickListener {
+            // Nếu đang retry → hủy
+            if (retryJob?.isActive == true) {
+                retryJob?.cancel()
+                resetConnectButton()
+                setStatus("⏹ Đã hủy kết nối.", "#6677aa")
+                return@setOnClickListener
+            }
+
             val portStr = etPort.text.toString().trim()
-            val port = portStr.toIntOrNull()
+            val port    = portStr.toIntOrNull()
 
             if (port == null || port <= 0 || port > 65535) {
-                setStatus("⚠️ Port không hợp lệ\nNhập đúng số port từ màn hình Wireless Debugging", "#ffd740")
+                setStatus("⚠️ Port không hợp lệ!\nNhập đúng số port từ màn hình Wireless Debugging.", "#ffd740")
                 return@setOnClickListener
             }
 
             if (!Settings.canDrawOverlays(this)) {
-                setStatus("⚠️ Cần cấp Quyền cửa sổ nổi trước (Bước 1)", "#ffd740")
+                setStatus("⚠️ Cần cấp Quyền cửa sổ nổi trước (Bước 1).", "#ffd740")
                 return@setOnClickListener
             }
 
-            // Lưu port
-            getSharedPreferences("kmp", MODE_PRIVATE).edit()
-                .putString("port", portStr).apply()
+            getSharedPreferences("kmp", MODE_PRIVATE)
+                .edit().putString("port", portStr).apply()
 
-            doConnect(port)
+            startRetryConnect(port)
         }
 
-        // Bắt đầu Gaming Mode
         btnGaming.setOnClickListener {
             if (!isConnected) {
-                setStatus("⚠️ Kết nối ADB trước", "#ffd740")
+                setStatus("⚠️ Kết nối ADB trước!", "#ffd740")
                 return@setOnClickListener
             }
             KeymapperService.start(this)
@@ -120,82 +123,127 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun doConnect(port: Int) {
-        btnConnect.isEnabled = false
-        btnConnect.text = "⏳ Đang kết nối..."
-        setStatus("🔄 Đang kết nối 127.0.0.1:$port ...\n\nNếu hiện hộp thoại 'Cho phép gỡ lỗi' → Nhấn Cho phép", "#448aff")
+    // ── Retry loop ──────────────────────────────────────────────────────
 
-        scope.launch {
-            val manager = AdbConnectionManager(this@MainActivity)
-            adb = manager
+    private fun startRetryConnect(port: Int) {
+        btnConnect.text = "⏹ Hủy kết nối"
+        btnGaming.isEnabled = false
 
-            val result = manager.connectWithResult("127.0.0.1", port)
+        retryJob = scope.launch {
+            val maxTry   = 8
+            val waitSec  = 5
 
-            when (result) {
-                is AdbConnectionManager.ConnectResult.Success -> {
-                    isConnected = true
-                    setBadge("● Đã kết nối", "#00e676")
-                    setStatus(
-                        "✅ Kết nối ADB thành công!\n\n" +
-                        "Nhấn Bắt đầu Gaming Mode\nrồi cắm chuột + bàn phím vào là chơi được.",
-                        "#00e676"
-                    )
-                    btnGaming.isEnabled = true
-                    btnConnect.text = "🔄 Kết nối lại"
+            for (attempt in 1..maxTry) {
+                setStatus(
+                    "🔄 Kết nối 127.0.0.1:$port (lần $attempt/$maxTry)...\n\n" +
+                    "👁 Chú ý màn hình:\n" +
+                    "Nếu hiện hộp thoại 'Cho phép gỡ lỗi qua USB?'\n" +
+                    "→ Nhấn  LUÔN CHO PHÉP  từ máy tính này",
+                    "#448aff"
+                )
 
-                    // Lưu port để dùng trong Service
-                    getSharedPreferences("kmp", MODE_PRIVATE).edit()
-                        .putInt("adb_port", port).apply()
-                }
+                val result = AdbConnectionManager(this@MainActivity)
+                    .connectWithResult("127.0.0.1", port)
 
-                is AdbConnectionManager.ConnectResult.ConnectionRefused -> {
-                    setStatus(
-                        "❌ Kết nối bị từ chối (port $port)\n\n" +
-                        "Kiểm tra:\n" +
-                        "• Wireless Debugging đang bật?\n" +
-                        "• Port đúng chưa? (Xem lại số port trong Wireless Debugging)\n" +
-                        "• Thử tắt/bật lại Wireless Debugging",
-                        "#ff1744"
-                    )
-                    btnConnect.text = "🔗  Kết nối ADB"
-                }
+                when (result) {
+                    // ── Thành công ──────────────────────────────────
+                    is AdbConnectionManager.ConnectResult.Success -> {
+                        isConnected = true
+                        setBadge("● Đã kết nối", "#00e676")
+                        setStatus(
+                            "✅ Kết nối ADB thành công!\n\n" +
+                            "Nhấn ▶ Bắt đầu Gaming Mode\n" +
+                            "rồi cắm chuột + bàn phím USB vào máy.",
+                            "#00e676"
+                        )
+                        btnGaming.isEnabled = true
+                        btnConnect.text = "🔄 Kết nối lại"
+                        getSharedPreferences("kmp", MODE_PRIVATE)
+                            .edit().putInt("adb_port", port).apply()
+                        return@launch
+                    }
 
-                is AdbConnectionManager.ConnectResult.AuthFailed -> {
-                    setStatus(
-                        "🔑 Cần xác nhận\n\n" +
-                        "Kiểm tra màn hình điện thoại:\n" +
-                        "Có hộp thoại 'Cho phép gỡ lỗi qua USB?' không?\n" +
-                        "→ Nhấn 'Cho phép' rồi nhấn Kết nối lại",
-                        "#ffd740"
-                    )
-                    btnConnect.text = "🔗  Kết nối lại"
-                }
+                    // ── Cần xác nhận → tiếp tục đợi ────────────────
+                    is AdbConnectionManager.ConnectResult.AuthFailed -> {
+                        if (attempt < maxTry) {
+                            for (s in waitSec downTo 1) {
+                                setStatus(
+                                    "🔑 Đang chờ bạn nhấn 'Cho phép' trên hộp thoại...\n\n" +
+                                    "Thử lại sau ${s}s  (lần ${attempt + 1}/$maxTry)\n\n" +
+                                    "Nếu không thấy hộp thoại:\n" +
+                                    "Vào Tùy chọn nhà phát triển\n" +
+                                    "→ Thu hồi ủy quyền gỡ lỗi USB → OK\n" +
+                                    "→ Rồi thử lại",
+                                    "#ffd740"
+                                )
+                                delay(1000)
+                            }
+                        }
+                    }
 
-                is AdbConnectionManager.ConnectResult.Timeout -> {
-                    setStatus(
-                        "❌ Timeout - Không phản hồi\n\n" +
-                        "• Wireless Debugging có đang bật?\n" +
-                        "• Port $port có đúng không?",
-                        "#ff1744"
-                    )
-                    btnConnect.text = "🔗  Kết nối ADB"
-                }
+                    // ── Kết nối bị từ chối ──────────────────────────
+                    is AdbConnectionManager.ConnectResult.ConnectionRefused -> {
+                        setStatus(
+                            "❌ Kết nối bị từ chối (port $port)\n\n" +
+                            "• Wireless Debugging có đang bật không?\n" +
+                            "• Port $port có đúng không?\n" +
+                            "  (Xem lại số trong Wireless Debugging)",
+                            "#ff1744"
+                        )
+                        resetConnectButton()
+                        return@launch
+                    }
 
-                is AdbConnectionManager.ConnectResult.Error -> {
-                    setStatus("❌ Lỗi: ${result.message}", "#ff1744")
-                    btnConnect.text = "🔗  Kết nối ADB"
+                    // ── Timeout ─────────────────────────────────────
+                    is AdbConnectionManager.ConnectResult.Timeout -> {
+                        setStatus(
+                            "❌ Không phản hồi (timeout)\n\n" +
+                            "• Wireless Debugging đang bật?\n" +
+                            "• Port $port có đúng không?",
+                            "#ff1744"
+                        )
+                        resetConnectButton()
+                        return@launch
+                    }
+
+                    // ── Lỗi khác ────────────────────────────────────
+                    is AdbConnectionManager.ConnectResult.Error -> {
+                        setStatus("❌ Lỗi: ${result.message}", "#ff1744")
+                        resetConnectButton()
+                        return@launch
+                    }
                 }
             }
 
-            btnConnect.isEnabled = true
+            // Hết maxTry vẫn không được
+            setStatus(
+                "❌ Không thể kết nối sau $maxTry lần thử.\n\n" +
+                "━━ Cách khắc phục ━━\n\n" +
+                "1. Vào Tùy chọn nhà phát triển\n" +
+                "2. Nhấn 'Thu hồi ủy quyền gỡ lỗi USB'\n" +
+                "3. Nhấn OK\n" +
+                "4. Quay lại app → Nhấn Kết nối lại\n" +
+                "5. Lần này nhấn 'LUÔN CHO PHÉP' trên hộp thoại",
+                "#ff1744"
+            )
+            resetConnectButton()
         }
     }
 
+    // ── Helpers ────────────────────────────────────────────────────────
+
+    private fun resetConnectButton() {
+        btnConnect.isEnabled = true
+        btnConnect.text      = "🔗  Kết nối ADB"
+    }
+
     private fun checkPermissions() {
-        // Cập nhật trạng thái nút quyền
         if (Settings.canDrawOverlays(this)) {
-            btnGrantOverlay.text = "✓ Đã cấp"
+            btnGrantOverlay.text      = "✓ Đã cấp"
             btnGrantOverlay.isEnabled = false
+        } else {
+            btnGrantOverlay.text      = "CẤP QUYỀN"
+            btnGrantOverlay.isEnabled = true
         }
     }
 
