@@ -6,7 +6,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.ConnectException
+import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.PrivateKey
@@ -30,6 +33,15 @@ class AdbConnectionManager(private val context: Context) {
             "host::features=shell_v2,cmd,stat_v2,ls_v2,fixed_push_mkdir"
     }
 
+    // ── Result types ──
+    sealed class ConnectResult {
+        object Success : ConnectResult()
+        object AuthFailed : ConnectResult()
+        object ConnectionRefused : ConnectResult()
+        object Timeout : ConnectResult()
+        data class Error(val message: String) : ConnectResult()
+    }
+
     private var socket: Socket? = null
     private var ins: InputStream? = null
     private var outs: OutputStream? = null
@@ -44,35 +56,73 @@ class AdbConnectionManager(private val context: Context) {
     var onConnected: (() -> Unit)? = null
     var onDisconnected: ((String) -> Unit)? = null
 
+    // ── Simple connect (backward compat) ──
     suspend fun connect(host: String = "127.0.0.1", port: Int = 5555): Boolean {
+        return connectWithResult(host, port) is ConnectResult.Success
+    }
+
+    // ── Connect with result type ──
+    suspend fun connectWithResult(host: String, port: Int): ConnectResult {
         return withContext(Dispatchers.IO) {
             try {
+                Log.d(TAG, "→ Kết nối tới $host:$port")
+
                 val (privKey, pubKey) = AdbKeyPairGenerator.getOrCreate(context)
                 privateKey = privKey
                 publicKeyBytes = pubKey
 
-                socket = Socket(host, port).apply {
-                    tcpNoDelay = true
-                    keepAlive = true
-                    soTimeout = 8000
+                // Tạo socket với timeout
+                socket = try {
+                    Socket().also { s ->
+                        s.connect(InetSocketAddress(host, port), 8000)
+                        s.tcpNoDelay = true
+                        s.keepAlive = true
+                        s.soTimeout = 8000
+                    }
+                } catch (e: ConnectException) {
+                    Log.e(TAG, "Kết nối bị từ chối: ${e.message}")
+                    return@withContext ConnectResult.ConnectionRefused
+                } catch (e: SocketTimeoutException) {
+                    Log.e(TAG, "Timeout kết nối: ${e.message}")
+                    return@withContext ConnectResult.Timeout
                 }
+
                 ins = socket!!.getInputStream()
                 outs = socket!!.getOutputStream()
 
                 sendCnxn()
-                val success = performHandshake()
+                val success = try {
+                    performHandshake()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Handshake thất bại: ${e.message}")
+                    disconnect()
+                    return@withContext ConnectResult.AuthFailed
+                }
 
                 if (success) {
                     socket!!.soTimeout = 0
                     connected.set(true)
                     openShellStream()
                     onConnected?.invoke()
+                    Log.d(TAG, "✅ Kết nối ADB thành công!")
+                    ConnectResult.Success
+                } else {
+                    disconnect()
+                    ConnectResult.AuthFailed
                 }
-                success
-            } catch (e: Exception) {
-                Log.e(TAG, "Lỗi kết nối: ${e.message}")
+
+            } catch (e: SocketTimeoutException) {
                 disconnect()
-                false
+                Log.e(TAG, "Timeout: ${e.message}")
+                ConnectResult.Timeout
+            } catch (e: ConnectException) {
+                disconnect()
+                Log.e(TAG, "Connection refused: ${e.message}")
+                ConnectResult.ConnectionRefused
+            } catch (e: Exception) {
+                disconnect()
+                Log.e(TAG, "Lỗi kết nối: ${e.message}")
+                ConnectResult.Error(e.message ?: "Lỗi không xác định")
             }
         }
     }
@@ -84,7 +134,10 @@ class AdbConnectionManager(private val context: Context) {
 
     private fun performHandshake(): Boolean {
         val first = readMessage() ?: return false
-        if (first.command == A_CNXN) return true
+        if (first.command == A_CNXN) {
+            Log.d(TAG, "Thiết bị đã trust key")
+            return true
+        }
         if (first.command != A_AUTH || first.arg0 != AUTH_TOKEN) return false
 
         val signature = AdbKeyPairGenerator.signToken(first.data, privateKey!!)
@@ -94,6 +147,7 @@ class AdbConnectionManager(private val context: Context) {
         if (second.command == A_CNXN) return true
 
         if (second.command == A_AUTH && second.arg0 == AUTH_TOKEN) {
+            Log.d(TAG, "Gửi public key để trust...")
             sendMessage(A_AUTH, AUTH_RSAPUBLICKEY, 0, publicKeyBytes!!)
             socket!!.soTimeout = 30_000
             val third = readMessage()
@@ -113,6 +167,7 @@ class AdbConnectionManager(private val context: Context) {
                 remoteId = response.arg0,
                 writeMessage = { cmd, a0, a1, data -> sendMessage(cmd, a0, a1, data) }
             )
+            Log.d(TAG, "Shell stream sẵn sàng")
         }
     }
 
@@ -160,7 +215,9 @@ class AdbConnectionManager(private val context: Context) {
             } else ByteArray(0)
 
             AdbMessage(command, arg0, arg1, data)
-        } catch (e: Exception) { null }
+        } catch (e: Exception) {
+            null
+        }
     }
 
     fun isConnected() = connected.get()
