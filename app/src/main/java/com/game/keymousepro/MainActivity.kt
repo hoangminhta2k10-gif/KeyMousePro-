@@ -1,14 +1,15 @@
 package com.game.keymousepro
 
 import android.content.Intent
+import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
-import android.widget.Button
-import android.widget.EditText
-import android.widget.TextView
+import android.view.View
+import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
-import com.game.keymousepro.adb.AdbConnectionManager
+import com.game.keymousepro.adb.ConnectionStateManager
+import com.game.keymousepro.adb.WirelessConnectionManager
 import com.game.keymousepro.service.KeymapperService
 import kotlinx.coroutines.*
 
@@ -16,256 +17,284 @@ class MainActivity : AppCompatActivity() {
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
-    private lateinit var tvBadge        : TextView
-    private lateinit var tvStatus       : TextView
-    private lateinit var etPort         : EditText
-    private lateinit var btnGrantOverlay: Button
-    private lateinit var btnGrantBattery: Button
-    private lateinit var btnOpenDev     : Button
-    private lateinit var btnConnect     : Button
-    private lateinit var btnGaming      : Button
+    // ── Views ──────────────────────────────────────────────────────
+    private lateinit var tvBadge    : TextView
+    private lateinit var tvEmoji    : TextView
+    private lateinit var tvTitle    : TextView
+    private lateinit var tvSubtitle : TextView
+    private lateinit var layoutCode : View
+    private lateinit var layoutFix  : View
+    private lateinit var etCode     : EditText
+    private lateinit var btnCode    : Button
+    private lateinit var btnMain    : Button
+    private lateinit var btnPerm    : Button
+    private lateinit var btnDev     : Button
+    private lateinit var btnGame    : Button
+    private lateinit var tvFix      : TextView
 
-    private var isConnected  = false
-    private var retryJob     : Job? = null
+    // Step views
+    private lateinit var s1i: TextView; private lateinit var s1t: TextView
+    private lateinit var s2i: TextView; private lateinit var s2t: TextView
+    private lateinit var s3i: TextView; private lateinit var s3t: TextView
+    private lateinit var s4i: TextView; private lateinit var s4t: TextView
+
+    // ── Managers ───────────────────────────────────────────────────
+    private lateinit var stateMgr : ConnectionStateManager
+    private lateinit var connMgr  : WirelessConnectionManager
+    private var isRunning = false
+
+    // ══════════════════════════════════════════════════════════════
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-        bindViews()
-        setupListeners()
-        checkPermissions()
-
-        val saved = getSharedPreferences("kmp", MODE_PRIVATE)
-            .getString("port", "") ?: ""
-        if (saved.isNotEmpty()) etPort.setText(saved)
+        bind()
+        initManagers()
+        setupButtons()
+        observeState()
     }
 
-    private fun bindViews() {
-        tvBadge         = findViewById(R.id.tvBadge)
-        tvStatus        = findViewById(R.id.tvStatus)
-        etPort          = findViewById(R.id.etPort)
-        btnGrantOverlay = findViewById(R.id.btnGrantOverlay)
-        btnGrantBattery = findViewById(R.id.btnGrantBattery)
-        btnOpenDev      = findViewById(R.id.btnOpenDevOptions)
-        btnConnect      = findViewById(R.id.btnConnect)
-        btnGaming       = findViewById(R.id.btnGaming)
+    private fun bind() {
+        tvBadge    = findViewById(R.id.tvBadge)
+        tvEmoji    = findViewById(R.id.tvEmoji)
+        tvTitle    = findViewById(R.id.tvTitle)
+        tvSubtitle = findViewById(R.id.tvSubtitle)
+        layoutCode = findViewById(R.id.layoutCode)
+        layoutFix  = findViewById(R.id.layoutFix)
+        etCode     = findViewById(R.id.etCode)
+        btnCode    = findViewById(R.id.btnCode)
+        btnMain    = findViewById(R.id.btnMain)
+        btnPerm    = findViewById(R.id.btnPerm)
+        btnDev     = findViewById(R.id.btnDev)
+        btnGame    = findViewById(R.id.btnGame)
+        tvFix      = findViewById(R.id.tvFix)
+
+        s1i = findViewById(R.id.s1i); s1t = findViewById(R.id.s1t)
+        s2i = findViewById(R.id.s2i); s2t = findViewById(R.id.s2t)
+        s3i = findViewById(R.id.s3i); s3t = findViewById(R.id.s3t)
+        s4i = findViewById(R.id.s4i); s4t = findViewById(R.id.s4t)
     }
 
-    private fun setupListeners() {
+    private fun initManagers() {
+        stateMgr = ConnectionStateManager(this)
+        connMgr  = WirelessConnectionManager(
+            context = this,
+            state   = stateMgr,
+            onConnected = { host, port ->
+                runOnUiThread {
+                    btnGame.isEnabled = true
+                    getSharedPreferences("kmp", MODE_PRIVATE).edit()
+                        .putString("adb_host", host)
+                        .putInt("adb_port", port)
+                        .apply()
+                }
+            }
+        )
+    }
 
-        btnGrantOverlay.setOnClickListener {
-            startActivity(
-                Intent(
-                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                    Uri.parse("package:$packageName")
-                )
-            )
-        }
+    private fun setupButtons() {
 
-        btnGrantBattery.setOnClickListener {
-            try {
-                startActivity(
-                    Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                        data = Uri.parse("package:$packageName")
-                    }
-                )
-            } catch (e: Exception) {
-                startActivity(Intent(Settings.ACTION_BATTERY_SAVER_SETTINGS))
+        // ── Main connect / cancel button ──────────────────────────
+        btnMain.setOnClickListener {
+            if (isRunning) {
+                connMgr.cancel()
+                stateMgr.setIdle()
+                isRunning = false
+            } else {
+                if (!Settings.canDrawOverlays(this)) {
+                    Toast.makeText(this,
+                        "Cấp Quyền cửa sổ nổi trước (nhấn 🔓 Quyền)",
+                        Toast.LENGTH_LONG).show()
+                    return@setOnClickListener
+                }
+                isRunning = true
+                connMgr.start(scope)
             }
         }
 
-        btnOpenDev.setOnClickListener {
-            // Mở thẳng Tùy chọn nhà phát triển
+        // ── Pairing code submit ───────────────────────────────────
+        btnCode.setOnClickListener {
+            val code = etCode.text.toString().trim()
+            if (code.length != 6) {
+                Toast.makeText(this, "Mã phải có đúng 6 số!", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            etCode.isEnabled   = false
+            btnCode.isEnabled  = false
+            connMgr.submitCode(code, scope)
+        }
+
+        // ── Permissions ───────────────────────────────────────────
+        btnPerm.setOnClickListener {
+            android.app.AlertDialog.Builder(this)
+                .setTitle("Cấp quyền cần thiết")
+                .setItems(arrayOf(
+                    "🪟  Quyền cửa sổ nổi (Bắt buộc)",
+                    "⚡  Bỏ tối ưu pin (Khuyến nghị)"
+                )) { _, i ->
+                    when (i) {
+                        0 -> startActivity(Intent(
+                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.parse("package:$packageName")
+                        ))
+                        1 -> try {
+                            startActivity(Intent(
+                                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+                            ).also { it.data = Uri.parse("package:$packageName") })
+                        } catch (_: Exception) {
+                            startActivity(Intent(Settings.ACTION_BATTERY_SAVER_SETTINGS))
+                        }
+                    }
+                }
+                .show()
+        }
+
+        // ── Open Developer Options ────────────────────────────────
+        btnDev.setOnClickListener {
             try {
-                startActivity(
-                    Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)
-                )
-            } catch (e: Exception) {
+                startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
+            } catch (_: Exception) {
                 startActivity(Intent(Settings.ACTION_SETTINGS))
             }
         }
 
-        btnConnect.setOnClickListener {
-            // Nếu đang retry → hủy
-            if (retryJob?.isActive == true) {
-                retryJob?.cancel()
-                resetConnectButton()
-                setStatus("⏹ Đã hủy kết nối.", "#6677aa")
-                return@setOnClickListener
-            }
-
-            val portStr = etPort.text.toString().trim()
-            val port    = portStr.toIntOrNull()
-
-            if (port == null || port <= 0 || port > 65535) {
-                setStatus("⚠️ Port không hợp lệ!\nNhập đúng số port từ màn hình Wireless Debugging.", "#ffd740")
-                return@setOnClickListener
-            }
-
-            if (!Settings.canDrawOverlays(this)) {
-                setStatus("⚠️ Cần cấp Quyền cửa sổ nổi trước (Bước 1).", "#ffd740")
-                return@setOnClickListener
-            }
-
-            getSharedPreferences("kmp", MODE_PRIVATE)
-                .edit().putString("port", portStr).apply()
-
-            startRetryConnect(port)
-        }
-
-        btnGaming.setOnClickListener {
-            if (!isConnected) {
-                setStatus("⚠️ Kết nối ADB trước!", "#ffd740")
-                return@setOnClickListener
-            }
+        // ── Start gaming mode ─────────────────────────────────────
+        btnGame.setOnClickListener {
             KeymapperService.start(this)
-            setStatus("🎮 Gaming Mode đang chạy!\nCắm chuột và bàn phím USB vào máy.", "#00e676")
+            Toast.makeText(this, "🎮 Gaming Mode đang chạy!", Toast.LENGTH_SHORT).show()
         }
     }
 
-    // ── Retry loop ──────────────────────────────────────────────────────
+    // ── State Observer ──────────────────────────────────────────────
 
-    private fun startRetryConnect(port: Int) {
-        btnConnect.text = "⏹ Hủy kết nối"
-        btnGaming.isEnabled = false
+    private fun observeState() {
+        scope.launch {
+            stateMgr.state.collect { s -> render(s) }
+        }
+    }
 
-        retryJob = scope.launch {
-            val maxTry   = 8
-            val waitSec  = 5
+    private fun render(s: ConnectionStateManager.ConnState) {
+        tvEmoji.text    = s.emoji
+        tvTitle.text    = s.title
+        tvSubtitle.text = s.subtitle
 
-            for (attempt in 1..maxTry) {
-                setStatus(
-                    "🔄 Kết nối 127.0.0.1:$port (lần $attempt/$maxTry)...\n\n" +
-                    "👁 Chú ý màn hình:\n" +
-                    "Nếu hiện hộp thoại 'Cho phép gỡ lỗi qua USB?'\n" +
-                    "→ Nhấn  LUÔN CHO PHÉP  từ máy tính này",
-                    "#448aff"
-                )
+        when (s.step) {
 
-                val result = AdbConnectionManager(this@MainActivity)
-                    .connectWithResult("127.0.0.1", port)
+            ConnectionStateManager.Step.IDLE -> {
+                badge("● Offline", "#ff1744")
+                steps(0)
+                layoutCode.visibility = View.GONE
+                layoutFix.visibility  = View.GONE
+                btnGame.isEnabled     = false
+                isRunning             = false
+                btnMain.text          = "🔍  Tìm kiếm tự động"
+                btnMain.backgroundTintList =
+                    android.content.res.ColorStateList.valueOf(Color.parseColor("#00e676"))
+                etCode.isEnabled      = true
+                btnCode.isEnabled     = true
+            }
 
-                when (result) {
-                    // ── Thành công ──────────────────────────────────
-                    is AdbConnectionManager.ConnectResult.Success -> {
-                        isConnected = true
-                        setBadge("● Đã kết nối", "#00e676")
-                        setStatus(
-                            "✅ Kết nối ADB thành công!\n\n" +
-                            "Nhấn ▶ Bắt đầu Gaming Mode\n" +
-                            "rồi cắm chuột + bàn phím USB vào máy.",
-                            "#00e676"
-                        )
-                        btnGaming.isEnabled = true
-                        btnConnect.text = "🔄 Kết nối lại"
-                        getSharedPreferences("kmp", MODE_PRIVATE)
-                            .edit().putInt("adb_port", port).apply()
-                        return@launch
-                    }
+            ConnectionStateManager.Step.DISCOVERING -> {
+                badge("🔍 Đang tìm...", "#448aff")
+                steps(1)
+                layoutCode.visibility = View.GONE
+                layoutFix.visibility  = View.GONE
+                btnMain.text          = "⏹  Hủy"
+                btnMain.backgroundTintList =
+                    android.content.res.ColorStateList.valueOf(Color.parseColor("#ff3d6b"))
+            }
 
-                    // ── Cần xác nhận → tiếp tục đợi ────────────────
-                    is AdbConnectionManager.ConnectResult.AuthFailed -> {
-                        if (attempt < maxTry) {
-                            for (s in waitSec downTo 1) {
-                                setStatus(
-                                    "🔑 Đang chờ bạn nhấn 'Cho phép' trên hộp thoại...\n\n" +
-                                    "Thử lại sau ${s}s  (lần ${attempt + 1}/$maxTry)\n\n" +
-                                    "Nếu không thấy hộp thoại:\n" +
-                                    "Vào Tùy chọn nhà phát triển\n" +
-                                    "→ Thu hồi ủy quyền gỡ lỗi USB → OK\n" +
-                                    "→ Rồi thử lại",
-                                    "#ffd740"
-                                )
-                                delay(1000)
-                            }
-                        }
-                    }
+            ConnectionStateManager.Step.DEVICE_FOUND -> {
+                badge("✅ Thiết bị tìm thấy", "#00e676")
+                steps(1)
+                layoutCode.visibility = View.VISIBLE
+                layoutFix.visibility  = View.GONE
+                etCode.isEnabled      = true
+                btnCode.isEnabled     = true
+                etCode.text.clear()
+                etCode.requestFocus()
+            }
 
-                    // ── Kết nối bị từ chối ──────────────────────────
-                    is AdbConnectionManager.ConnectResult.ConnectionRefused -> {
-                        setStatus(
-                            "❌ Kết nối bị từ chối (port $port)\n\n" +
-                            "• Wireless Debugging có đang bật không?\n" +
-                            "• Port $port có đúng không?\n" +
-                            "  (Xem lại số trong Wireless Debugging)",
-                            "#ff1744"
-                        )
-                        resetConnectButton()
-                        return@launch
-                    }
+            ConnectionStateManager.Step.PAIRING -> {
+                badge("🔑 Đang ghép nối...", "#ffd740")
+                steps(2)
+                layoutCode.visibility = View.GONE
+                layoutFix.visibility  = View.GONE
+            }
 
-                    // ── Timeout ─────────────────────────────────────
-                    is AdbConnectionManager.ConnectResult.Timeout -> {
-                        setStatus(
-                            "❌ Không phản hồi (timeout)\n\n" +
-                            "• Wireless Debugging đang bật?\n" +
-                            "• Port $port có đúng không?",
-                            "#ff1744"
-                        )
-                        resetConnectButton()
-                        return@launch
-                    }
+            ConnectionStateManager.Step.CONNECTING,
+            ConnectionStateManager.Step.AUTHORIZING -> {
+                badge("🔗 Đang kết nối...", "#448aff")
+                steps(3)
+                layoutCode.visibility = View.GONE
+                layoutFix.visibility  = View.GONE
+            }
 
-                    // ── Lỗi khác ────────────────────────────────────
-                    is AdbConnectionManager.ConnectResult.Error -> {
-                        setStatus("❌ Lỗi: ${result.message}", "#ff1744")
-                        resetConnectButton()
-                        return@launch
-                    }
+            ConnectionStateManager.Step.CONNECTED -> {
+                badge("🎮 Đã kết nối", "#00e676")
+                steps(4)
+                layoutCode.visibility = View.GONE
+                layoutFix.visibility  = View.GONE
+                btnGame.isEnabled     = true
+                isRunning             = false
+                btnMain.text          = "🔄  Kết nối lại"
+                btnMain.backgroundTintList =
+                    android.content.res.ColorStateList.valueOf(Color.parseColor("#1c1c2e"))
+            }
+
+            ConnectionStateManager.Step.ERROR -> {
+                badge("❌ Lỗi", "#ff1744")
+                steps(0)
+                layoutCode.visibility = View.GONE
+                isRunning             = false
+                btnMain.text          = "🔍  Thử lại"
+                btnMain.backgroundTintList =
+                    android.content.res.ColorStateList.valueOf(Color.parseColor("#00e676"))
+                etCode.isEnabled      = true
+                btnCode.isEnabled     = true
+
+                if (s.solution.isNotEmpty()) {
+                    layoutFix.visibility = View.VISIBLE
+                    tvFix.text           = s.solution
+                } else {
+                    layoutFix.visibility = View.GONE
                 }
             }
-
-            // Hết maxTry vẫn không được
-            setStatus(
-                "❌ Không thể kết nối sau $maxTry lần thử.\n\n" +
-                "━━ Cách khắc phục ━━\n\n" +
-                "1. Vào Tùy chọn nhà phát triển\n" +
-                "2. Nhấn 'Thu hồi ủy quyền gỡ lỗi USB'\n" +
-                "3. Nhấn OK\n" +
-                "4. Quay lại app → Nhấn Kết nối lại\n" +
-                "5. Lần này nhấn 'LUÔN CHO PHÉP' trên hộp thoại",
-                "#ff1744"
-            )
-            resetConnectButton()
         }
     }
 
-    // ── Helpers ────────────────────────────────────────────────────────
+    // ── Helpers ────────────────────────────────────────────────────
 
-    private fun resetConnectButton() {
-        btnConnect.isEnabled = true
-        btnConnect.text      = "🔗  Kết nối ADB"
+    private fun steps(active: Int) {
+        listOf(
+            s1i to s1t, s2i to s2t, s3i to s3t, s4i to s4t
+        ).forEachIndexed { i, (icon, text) ->
+            when {
+                i + 1 < active  -> { icon.text="✓"; color(icon,"#00e676"); color(text,"#00e676") }
+                i + 1 == active -> { icon.text="●"; color(icon,"#448aff"); color(text,"#eef0ff") }
+                else            -> { icon.text="○"; color(icon,"#2a2a40"); color(text,"#2a2a40") }
+            }
+        }
     }
 
-    private fun checkPermissions() {
-        if (Settings.canDrawOverlays(this)) {
-            btnGrantOverlay.text      = "✓ Đã cấp"
-            btnGrantOverlay.isEnabled = false
-        } else {
-            btnGrantOverlay.text      = "CẤP QUYỀN"
-            btnGrantOverlay.isEnabled = true
-        }
+    private fun badge(text: String, hex: String) {
+        tvBadge.text = text
+        try { tvBadge.setTextColor(Color.parseColor(hex)) } catch (_: Exception) {}
+    }
+
+    private fun color(v: TextView, hex: String) {
+        try { v.setTextColor(Color.parseColor(hex)) } catch (_: Exception) {}
     }
 
     override fun onResume() {
         super.onResume()
-        checkPermissions()
-    }
-
-    private fun setStatus(msg: String, colorHex: String) {
-        tvStatus.text = msg
-        try { tvStatus.setTextColor(android.graphics.Color.parseColor(colorHex)) }
-        catch (_: Exception) {}
-    }
-
-    private fun setBadge(msg: String, colorHex: String) {
-        tvBadge.text = msg
-        try { tvBadge.setTextColor(android.graphics.Color.parseColor(colorHex)) }
-        catch (_: Exception) {}
+        if (Settings.canDrawOverlays(this)) btnPerm.alpha = 0.5f
+        else btnPerm.alpha = 1.0f
     }
 
     override fun onDestroy() {
         super.onDestroy()
         scope.cancel()
+        connMgr.destroy()
     }
 }
