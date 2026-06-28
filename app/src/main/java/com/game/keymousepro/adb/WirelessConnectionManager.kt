@@ -5,16 +5,14 @@ import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
-import kotlin.math.min
 
 /**
  * Điều phối toàn bộ luồng kết nối:
- * Auto-discover → Pair → Discover connect service → Connect → Start
+ * Auto-discover → Pair → Discover connect service → Connect
  */
 class WirelessConnectionManager(
     private val context: Context,
@@ -24,23 +22,25 @@ class WirelessConnectionManager(
     companion object {
         private const val TAG = "WirelessMgr"
 
-        private const val CONNECT_RETRIES = 6
-        private const val RETRY_DELAY_MS = 1_500L
+        private const val DISCOVERY_TIMEOUT_MS = 45_000L
+        private const val CONNECT_SERVICE_WAIT_ROUNDS = 6
+        private const val CONNECT_SERVICE_RETRY_DELAY_MS = 1_500L
 
-        private const val DISCOVERY_TIMEOUT_MS = 12_000L
-        private const val CONNECT_SERVICE_WAIT_MS = 15_000L
-        private const val CONNECT_SERVICE_POLL_MS = 1_000L
+        private const val CONNECT_RETRIES = 6
+        private const val CONNECT_RETRY_DELAY_MS = 1_500L
     }
 
     private val discovery = AutoDiscoveryManager(context)
+    private val pairing = AdbPairingManager(context)
+    private val adb = AdbConnectionManager(context)
+
     private var job: Job? = null
 
     fun start(scope: CoroutineScope) {
         job?.cancel()
         job = scope.launch {
             try {
-                trySavedConnectionFirst()
-                if (!isActive) return@launch
+                if (trySavedConnection()) return@launch
                 runDiscovery()
             } catch (_: CancellationException) {
                 Log.d(TAG, "Start cancelled")
@@ -54,27 +54,30 @@ class WirelessConnectionManager(
         }
     }
 
-    private suspend fun trySavedConnectionFirst() {
-        if (!state.hasSaved()) return
+    private suspend fun trySavedConnection(): Boolean {
+        if (!state.hasSaved()) return false
 
         val host = state.savedHost()
         val port = state.savedPort()
-        if (host.isBlank() || port <= 0) return
+        if (host.isBlank() || port <= 0) return false
 
         Log.d(TAG, "Trying saved connection: $host:$port")
         state.setConnecting(host, port)
         state.setAuthorizing()
 
-        if (doConnectWithRetry(host, port)) {
+        return if (doConnectWithRetry(host, port)) {
             state.setConnected(host, port)
             onConnected(host, port)
-            throw CancellationException("Connected from saved connection")
+            true
+        } else {
+            Log.d(TAG, "Saved connection failed, falling back to discovery")
+            false
         }
-
-        Log.d(TAG, "Saved connection failed, falling back to discovery")
     }
 
     private suspend fun runDiscovery() {
+        if (!isCurrentJobActive()) return
+
         state.setDiscovering()
 
         val result = withTimeoutOrNull(DISCOVERY_TIMEOUT_MS) {
@@ -86,7 +89,6 @@ class WirelessConnectionManager(
                 val svc = result.service
                 Log.d(TAG, "Pair service found: ${svc.host}:${svc.port}")
                 state.setDeviceFound(svc.host, svc.port)
-                // Chờ người dùng nhập mã ghép nối, submitCode() sẽ được gọi từ Activity
             }
 
             is AutoDiscoveryManager.DiscoveryResult.Timeout -> {
@@ -134,11 +136,11 @@ class WirelessConnectionManager(
     }
 
     private suspend fun doPairThenConnect(host: String, pairPort: Int, code: String) {
+        if (!isCurrentJobActive()) return
+
         state.setPairing()
 
-        val pairResult = AdbPairingManager(context).pairWithResult(host, pairPort, code)
-
-        when (pairResult) {
+        when (val pairResult = pairing.pairWithResult(host, pairPort, code)) {
             is AdbPairingManager.PairResult.Success -> {
                 Log.d(TAG, "Pair OK")
             }
@@ -185,7 +187,6 @@ class WirelessConnectionManager(
 
         Log.d(TAG, "Connect service found: $connHost:$connPort")
         state.setConnecting(connHost, connPort)
-        delay(300)
         state.setAuthorizing()
 
         if (doConnectWithRetry(connHost, connPort)) {
@@ -201,12 +202,9 @@ class WirelessConnectionManager(
         }
     }
 
-    private suspend fun waitForConnectService(): AutoDiscoveryManager.DiscoveredService? {
-        val start = System.currentTimeMillis()
-        var delayMs = CONNECT_SERVICE_POLL_MS
-
-        while (System.currentTimeMillis() - start < CONNECT_SERVICE_WAIT_MS) {
-            if (!isJobActive()) return null
+    private suspend fun waitForConnectService(): AutoDiscoveryManager.ServiceInfo? {
+        repeat(CONNECT_SERVICE_WAIT_ROUNDS) { index ->
+            if (!isCurrentJobActive()) return null
 
             when (val result = discovery.discoverConnectService()) {
                 is AutoDiscoveryManager.DiscoveryResult.Found -> {
@@ -214,7 +212,7 @@ class WirelessConnectionManager(
                 }
 
                 is AutoDiscoveryManager.DiscoveryResult.Timeout -> {
-                    // tiếp tục polling
+                    Log.d(TAG, "Connect service not found yet (${index + 1}/$CONNECT_SERVICE_WAIT_ROUNDS)")
                 }
 
                 is AutoDiscoveryManager.DiscoveryResult.Error -> {
@@ -222,22 +220,22 @@ class WirelessConnectionManager(
                 }
             }
 
-            delay(delayMs)
-            delayMs = min(delayMs + 500L, 2_500L)
+            if (index < CONNECT_SERVICE_WAIT_ROUNDS - 1) {
+                delay(CONNECT_SERVICE_RETRY_DELAY_MS)
+            }
         }
-
         return null
     }
 
     private suspend fun doConnectWithRetry(host: String, port: Int): Boolean {
         repeat(CONNECT_RETRIES) { index ->
-            if (!isJobActive()) return false
+            if (!isCurrentJobActive()) return false
 
             Log.d(TAG, "Connect attempt ${index + 1}/$CONNECT_RETRIES → $host:$port")
             if (doConnect(host, port)) return true
 
             if (index < CONNECT_RETRIES - 1) {
-                delay(RETRY_DELAY_MS)
+                delay(CONNECT_RETRY_DELAY_MS)
             }
         }
         return false
@@ -245,21 +243,32 @@ class WirelessConnectionManager(
 
     private suspend fun doConnect(host: String, port: Int): Boolean {
         return try {
-            val result = AdbConnectionManager(context).connectWithResult(host, port)
-            when (result) {
+            when (val result = adb.connectWithResult(host, port)) {
                 is AdbConnectionManager.ConnectResult.Success -> true
-                is AdbConnectionManager.ConnectResult.Failure -> {
-                    Log.e(TAG, "Connect failed: ${result.message}")
+                is AdbConnectionManager.ConnectResult.AuthFailed -> {
+                    Log.e(TAG, "ADB auth failed")
+                    false
+                }
+                is AdbConnectionManager.ConnectResult.ConnectionRefused -> {
+                    Log.e(TAG, "ADB connection refused")
+                    false
+                }
+                is AdbConnectionManager.ConnectResult.Timeout -> {
+                    Log.e(TAG, "ADB connection timeout")
+                    false
+                }
+                is AdbConnectionManager.ConnectResult.Error -> {
+                    Log.e(TAG, "ADB connection error: ${result.message}")
                     false
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Connect error: ${e.message}", e)
+            Log.e(TAG, "Connect exception: ${e.message}", e)
             false
         }
     }
 
-    private fun isJobActive(): Boolean {
+    private fun isCurrentJobActive(): Boolean {
         return job?.isActive == true
     }
 
