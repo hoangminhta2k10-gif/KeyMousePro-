@@ -1,110 +1,133 @@
+// File: app/src/main/java/com/game/keymousepro/adb/ConnectionStateManager.kt
 package com.game.keymousepro.adb
 
 import android.content.Context
 import android.util.Log
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
 
-class ConnectionStateManager(context: Context) {
+/**
+ * Tracks and persists ADB Wireless Debugging connection state across app
+ * restarts, and fans out state changes to UI observers.
+ *
+ * This is NOT part of the cryptographic protocol — it is an application-level
+ * convenience layer on top of WirelessConnectionManager's transient state
+ * machine, so unlike Spake2.kt / AdbPairingManager.kt it does not need to
+ * match any AOSP-internal behavior; it only needs to be internally consistent.
+ *
+ * Responsibilities:
+ *   1. Remember whether this device has EVER successfully paired (so the UI
+ *      can default to "Connect" instead of "Pair" on next launch).
+ *   2. Remember the last successful host (the port is intentionally NOT
+ *      persisted — connect ports are randomly reassigned by adbd on every
+ *      Wireless Debugging session, so caching a stale port would silently
+ *      reintroduce the exact "fallback to a stale/wrong port" bug class this
+ *      rewrite eliminated).
+ *   3. Provide a simple multi-listener callback API so multiple UI surfaces
+ *      (MainActivity, a status bar in KeymapperService's notification, etc.)
+ *      can all observe state without coupling to WirelessConnectionManager directly.
+ *
+ * Usage:
+ *   val stateMgr = ConnectionStateManager(context)
+ *   val wireless = WirelessConnectionManager(context)
+ *   wireless.onStateChanged = { state -> stateMgr.update(state) }
+ *   stateMgr.addListener { snapshot -> updateUi(snapshot) }
+ */
+class ConnectionStateManager(private val context: Context) {
 
-    companion object { private const val TAG = "ConnState" }
-
-    enum class Step {
-        IDLE, DISCOVERING, DEVICE_FOUND,
-        PAIRING, CONNECTING, AUTHORIZING,
-        CONNECTED, ERROR
+    companion object {
+        private const val TAG = "ConnectionStateMgr"
+        private const val PREFS = "keymousepro_conn_state"
+        private const val KEY_EVER_PAIRED = "ever_paired"
+        private const val KEY_LAST_HOST = "last_host"
+        private const val KEY_LAST_PAIRED_AT = "last_paired_at_ms"
+        private const val KEY_LAST_CONNECTED_AT = "last_connected_at_ms"
     }
 
-    data class ConnState(
-        val step           : Step   = Step.IDLE,
-        val emoji          : String = "⏸",
-        val title          : String = "Chưa kết nối",
-        val subtitle       : String = "",
-        val isLoading      : Boolean = false,
-        val showCodeInput  : Boolean = false,
-        val solution       : String = "",
-        val discoveredHost : String = "",
-        val discoveredPairPort : Int = 0,
-        val savedConnPort  : Int = 0
+    data class Snapshot(
+        val state: WirelessConnectionManager.State,
+        val everPaired: Boolean,
+        val lastHost: String?,
+        val lastPairedAtMs: Long,
+        val lastConnectedAtMs: Long,
+        val lastErrorMessage: String?,
     )
 
-    private val prefs = context.getSharedPreferences("kmp_v3", Context.MODE_PRIVATE)
-    private val _state = MutableStateFlow(ConnState())
-    val state: StateFlow<ConnState> = _state.asStateFlow()
+    private val prefs by lazy { context.getSharedPreferences(PREFS, Context.MODE_PRIVATE) }
+    private val listeners = mutableListOf<(Snapshot) -> Unit>()
 
-    private fun emit(s: ConnState) {
-        Log.d(TAG, "${s.step}: ${s.title}")
-        _state.value = s
+    @Volatile private var currentState = WirelessConnectionManager.State.IDLE
+    @Volatile private var lastError: String? = null
+
+    // ════════════════════════════════════════════════════════
+    //  Public API
+    // ════════════════════════════════════════════════════════
+
+    fun addListener(listener: (Snapshot) -> Unit) {
+        listeners.add(listener)
+        listener(snapshot())  // immediately push current state to new listener
     }
 
-    fun setIdle() = emit(ConnState(
-        step = Step.IDLE, emoji = "⏸", title = "Chưa kết nối"
-    ))
-
-    fun setDiscovering() = emit(ConnState(
-        step = Step.DISCOVERING, emoji = "🔍",
-        title = "Đang tìm Wireless Debugging...",
-        subtitle = "Mở Wireless Debugging →\nGhép nối thiết bị bằng mã ghép nối",
-        isLoading = true
-    ))
-
-    fun setDeviceFound(host: String, pairPort: Int) = emit(ConnState(
-        step = Step.DEVICE_FOUND, emoji = "✅",
-        title = "Tìm thấy Wireless Debugging!",
-        subtitle = "Nhập mã 6 số từ màn hình\n'Ghép nối thiết bị bằng mã'",
-        showCodeInput = true,
-        discoveredHost = host,
-        discoveredPairPort = pairPort
-    ))
-
-    fun setPairing() = emit(_state.value.copy(
-        step = Step.PAIRING, emoji = "🔑",
-        title = "Đang ghép nối...",
-        subtitle = "",
-        isLoading = true, showCodeInput = false
-    ))
-
-    fun setConnecting(host: String, port: Int) = emit(_state.value.copy(
-        step = Step.CONNECTING, emoji = "🔗",
-        title = "Đang kết nối ADB...",
-        subtitle = "$host:$port",
-        isLoading = true, savedConnPort = port
-    ))
-
-    fun setAuthorizing() = emit(_state.value.copy(
-        step = Step.AUTHORIZING, emoji = "🛡️",
-        title = "Chờ xác nhận...",
-        subtitle = "Nếu thấy hộp thoại trên màn hình\n→ Nhấn LUÔN CHO PHÉP",
-        isLoading = true
-    ))
-
-    fun setConnected(host: String, port: Int) {
-        saveConn(host, port)
-        emit(_state.value.copy(
-            step = Step.CONNECTED, emoji = "🎮",
-            title = "Kết nối thành công!",
-            subtitle = "Nhấn Bắt đầu Gaming Mode",
-            isLoading = false, showCodeInput = false, solution = ""
-        ))
+    fun removeListener(listener: (Snapshot) -> Unit) {
+        listeners.remove(listener)
     }
 
-    fun setError(title: String, solution: String = "") = emit(_state.value.copy(
-        step = Step.ERROR, emoji = "❌",
-        title = title, subtitle = "",
-        isLoading = false, showCodeInput = false,
-        solution = solution
-    ))
+    /** Call from WirelessConnectionManager.onStateChanged. */
+    fun update(state: WirelessConnectionManager.State) {
+        currentState = state
+        Log.d(TAG, "State → $state")
 
-    // ── Persistence ──────────────────────────────────────────────
+        when (state) {
+            WirelessConnectionManager.State.PAIRING -> lastError = null
+            WirelessConnectionManager.State.CONNECTED -> {
+                lastError = null
+                markConnected()
+            }
+            else -> { /* no persistence side-effect for other states */ }
+        }
 
-    fun saveConn(host: String, port: Int) {
-        prefs.edit().putString("h", host).putInt("p", port).putBoolean("ok", true).apply()
+        notifyListeners()
     }
 
-    fun hasSaved()    = prefs.getBoolean("ok", false)
-    fun savedHost()   = prefs.getString("h", "127.0.0.1") ?: "127.0.0.1"
-    fun savedPort()   = prefs.getInt("p", -1)
-    fun clearSaved()  = prefs.edit().clear().apply()
-    fun current()     = _state.value
+    /** Call from WirelessConnectionManager.onError. */
+    fun setError(message: String) {
+        lastError = message
+        Log.w(TAG, "Error: $message")
+        notifyListeners()
+    }
+
+    /** Call right after AdbPairingManager.pair() returns true. */
+    fun markPaired(host: String) {
+        prefs.edit()
+            .putBoolean(KEY_EVER_PAIRED, true)
+            .putString(KEY_LAST_HOST, host)
+            .putLong(KEY_LAST_PAIRED_AT, System.currentTimeMillis())
+            .apply()
+        Log.d(TAG, "Marked paired: $host")
+        notifyListeners()
+    }
+
+    private fun markConnected() {
+        prefs.edit().putLong(KEY_LAST_CONNECTED_AT, System.currentTimeMillis()).apply()
+    }
+
+    fun snapshot(): Snapshot = Snapshot(
+        state = currentState,
+        everPaired = prefs.getBoolean(KEY_EVER_PAIRED, false),
+        lastHost = prefs.getString(KEY_LAST_HOST, null),
+        lastPairedAtMs = prefs.getLong(KEY_LAST_PAIRED_AT, 0L),
+        lastConnectedAtMs = prefs.getLong(KEY_LAST_CONNECTED_AT, 0L),
+        lastErrorMessage = lastError,
+    )
+
+    /** Wipe persisted pairing state (e.g. user taps "Forget this device"). */
+    fun clear() {
+        prefs.edit().clear().apply()
+        lastError = null
+        Log.d(TAG, "Connection state cleared")
+        notifyListeners()
+    }
+
+    private fun notifyListeners() {
+        val snap = snapshot()
+        listeners.forEach { it(snap) }
+    }
 }

@@ -1,0 +1,288 @@
+// File: app/src/main/java/com/game/keymousepro/adb/AdbKeyPairGenerator.kt
+package com.game.keymousepro.adb
+
+import android.content.Context
+import android.util.Base64
+import android.util.Log
+import org.bouncycastle.asn1.x500.X500Name
+import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
+import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
+import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
+import java.io.ByteArrayInputStream
+import java.math.BigInteger
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.security.*
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
+import java.security.interfaces.RSAPublicKey
+import java.security.spec.ECGenParameterSpec
+import java.security.spec.PKCS8EncodedKeySpec
+import java.util.Date
+
+/**
+ * Manages two key types for ADB Wireless Debugging:
+ *
+ * 1. EC P-256 — TLS identity (Wireless Debugging)
+ *    Generated once, persisted, used for BOTH pairing and connection TLS.
+ *    The self-signed X.509 certificate is what adbd records during pairing.
+ *    MUST be the identical certificate in both phases.
+ *
+ * 2. RSA 2048 — ADB authentication (classic AUTH_TOKEN flow + PeerInfo payload)
+ *    Used for AUTH_SIGNATURE response and sent in PeerInfo during pairing.
+ *    Format matches adb_auth_host.cpp RSA_to_wire() (Montgomery form, LE).
+ *
+ * Reference: system/core/adb/adb_auth_host.cpp
+ *            packages/modules/adb/pairing_connection/
+ */
+object AdbKeyPairGenerator {
+
+    private const val TAG = "AdbKeyPairGenerator"
+    private const val PREFS = "keymousepro_adb_v2"
+
+    // ── SharedPreferences keys ──
+    private const val K_EC_PRIV  = "ec_priv_pkcs8"
+    private const val K_EC_CERT  = "ec_cert_der"
+    private const val K_RSA_PRIV = "rsa_priv_pkcs8"
+    private const val K_RSA_ADB  = "rsa_adb_wire"   // ADB wire format (base64 + host)
+
+    // ── Memory cache ──
+    @Volatile private var ecPrivKey: PrivateKey? = null
+    @Volatile private var ecCert: X509Certificate? = null
+    @Volatile private var rsaPrivKey: PrivateKey? = null
+    @Volatile private var rsaAdbKey: ByteArray? = null
+
+    data class EcKeySet(val privateKey: PrivateKey, val certificate: X509Certificate)
+    data class RsaKeySet(val privateKey: PrivateKey, val adbPublicKey: ByteArray)
+
+    // ════════════════════════════════════════════════════════
+    //  EC P-256 — TLS Certificate
+    // ════════════════════════════════════════════════════════
+
+    /**
+     * Get (or generate) the EC P-256 TLS key pair + self-signed certificate.
+     *
+     * This certificate fingerprint is recorded by adbd during pairing.
+     * The SAME certificate must be presented during connection TLS handshake.
+     * Never regenerate between pairing and connecting.
+     */
+    @Synchronized
+    fun getOrCreateEcKeySet(context: Context): EcKeySet {
+        ecPrivKey?.let { p -> ecCert?.let { c -> return EcKeySet(p, c) } }
+
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val privB64 = prefs.getString(K_EC_PRIV, null)
+        val certB64 = prefs.getString(K_EC_CERT, null)
+
+        if (privB64 != null && certB64 != null) {
+            return try {
+                val priv = KeyFactory.getInstance("EC")
+                    .generatePrivate(PKCS8EncodedKeySpec(Base64.decode(privB64, Base64.DEFAULT)))
+                val cert = CertificateFactory.getInstance("X.509")
+                    .generateCertificate(
+                        ByteArrayInputStream(Base64.decode(certB64, Base64.DEFAULT))
+                    ) as X509Certificate
+                Log.d(TAG, "Loaded EC key. Cert SHA-256: ${certFingerprint(cert)}")
+                ecPrivKey = priv; ecCert = cert
+                EcKeySet(priv, cert)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load EC key, regenerating: ${e.message}")
+                generateEcKeySet(context)
+            }
+        }
+
+        return generateEcKeySet(context)
+    }
+
+    private fun generateEcKeySet(context: Context): EcKeySet {
+        Log.d(TAG, "Generating new EC P-256 key pair (TLS identity)...")
+
+        val kg = KeyPairGenerator.getInstance("EC")
+        kg.initialize(ECGenParameterSpec("secp256r1"), SecureRandom())
+        val kp = kg.generateKeyPair()
+
+        // Self-signed X.509 certificate, 10-year validity
+        val now      = System.currentTimeMillis()
+        val notBefore = Date(now - 60_000L)
+        val notAfter  = Date(now + 10L * 365 * 24 * 3600 * 1000L)
+        val dn        = X500Name("CN=KeyMousePro_ADB_Client")
+
+        val builder = JcaX509v3CertificateBuilder(
+            dn, BigInteger.valueOf(SecureRandom().nextLong().and(0x7FFF_FFFF_FFFF_FFFFL).or(1L)),
+            notBefore, notAfter, dn, kp.public
+        )
+        val signer = JcaContentSignerBuilder("SHA256withECDSA").build(kp.private)
+        val cert   = JcaX509CertificateConverter().getCertificate(builder.build(signer))
+
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        prefs.edit()
+            .putString(K_EC_PRIV, Base64.encodeToString(kp.private.encoded, Base64.NO_WRAP))
+            .putString(K_EC_CERT, Base64.encodeToString(cert.encoded, Base64.NO_WRAP))
+            .apply()
+
+        Log.d(TAG, "EC P-256 generated. Cert SHA-256: ${certFingerprint(cert)}")
+        ecPrivKey = kp.private; ecCert = cert
+        return EcKeySet(kp.private, cert)
+    }
+
+    // ════════════════════════════════════════════════════════
+    //  RSA 2048 — ADB Auth Key
+    // ════════════════════════════════════════════════════════
+
+    /**
+     * Get (or generate) RSA 2048 key pair.
+     * adbPublicKey is the ADB wire format (Montgomery form, base64 + " host\0").
+     * This is the payload sent in PeerInfo during pairing, and used for AUTH_SIGNATURE.
+     */
+    @Synchronized
+    fun getOrCreateRsaKeySet(context: Context): RsaKeySet {
+        rsaPrivKey?.let { p -> rsaAdbKey?.let { k -> return RsaKeySet(p, k) } }
+
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val privB64 = prefs.getString(K_RSA_PRIV, null)
+        val adbB64  = prefs.getString(K_RSA_ADB,  null)
+
+        if (privB64 != null && adbB64 != null) {
+            return try {
+                val priv = KeyFactory.getInstance("RSA")
+                    .generatePrivate(PKCS8EncodedKeySpec(Base64.decode(privB64, Base64.DEFAULT)))
+                val adb  = Base64.decode(adbB64, Base64.DEFAULT)
+                Log.d(TAG, "Loaded RSA 2048 key (ADB wire: ${adb.size} bytes)")
+                rsaPrivKey = priv; rsaAdbKey = adb
+                RsaKeySet(priv, adb)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load RSA key, regenerating: ${e.message}")
+                generateRsaKeySet(context)
+            }
+        }
+
+        return generateRsaKeySet(context)
+    }
+
+    private fun generateRsaKeySet(context: Context): RsaKeySet {
+        Log.d(TAG, "Generating new RSA 2048 key pair (ADB auth)...")
+
+        val kg = KeyPairGenerator.getInstance("RSA")
+        kg.initialize(2048, SecureRandom())
+        val kp  = kg.generateKeyPair()
+        val adb = encodeRsaKeyForAdb(kp.public as RSAPublicKey)
+
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        prefs.edit()
+            .putString(K_RSA_PRIV, Base64.encodeToString(kp.private.encoded, Base64.NO_WRAP))
+            .putString(K_RSA_ADB,  Base64.encodeToString(adb, Base64.NO_WRAP))
+            .apply()
+
+        Log.d(TAG, "RSA 2048 generated. ADB key: ${adb.size} bytes")
+        rsaPrivKey = kp.private; rsaAdbKey = adb
+        return RsaKeySet(kp.private, adb)
+    }
+
+    /**
+     * Sign an ADB AUTH token with RSA private key.
+     * Algorithm: SHA1withRSA (PKCS#1 v1.5), as required by ADB AUTH_SIGNATURE.
+     * Reference: system/core/adb/adb_auth.cpp
+     */
+    fun signAdbToken(token: ByteArray, privateKey: PrivateKey): ByteArray {
+        val sig = Signature.getInstance("SHA1withRSA")
+        sig.initSign(privateKey)
+        sig.update(token)
+        return sig.sign()
+    }
+
+    // ════════════════════════════════════════════════════════
+    //  RSA → ADB Wire Format (Montgomery form)
+    // ════════════════════════════════════════════════════════
+
+    /**
+     * Convert RSA public key to ADB wire format.
+     *
+     * Reference: system/core/adb/adb_auth_host.cpp RSA_to_wire()
+     *
+     * Binary layout (little-endian 32-bit words):
+     *   [len: int32]        ← number of 32-bit words in modulus (64 for RSA-2048)
+     *   [n0inv: int32]      ← -(n^-1 mod 2^32)  [Montgomery parameter]
+     *   [n[]: int32 * len]  ← modulus as LE 32-bit words, LSW first
+     *   [rr[]: int32 * len] ← R^2 mod n (Montgomery R^2), same format
+     *   [e: int32]          ← public exponent (65537)
+     *
+     * Then: Base64(binary) + " keymousepro@android" + '\0'
+     */
+    private fun encodeRsaKeyForAdb(key: RSAPublicKey): ByteArray {
+        // Modulus: strip leading zero byte from BigInteger representation
+        val rawMod = key.modulus.toByteArray()
+        val mod = if (rawMod[0] == 0.toByte()) rawMod.copyOfRange(1, rawMod.size) else rawMod
+        require(mod.size == 256) { "Expected 2048-bit RSA modulus (256 bytes), got ${mod.size}" }
+
+        val wordCount = mod.size / 4  // 64 words for RSA-2048
+        val e = key.publicExponent.toInt()
+
+        // n0inv = -(n^-1) mod 2^32   (Newton's method)
+        val n0  = readInt32LE(mod, mod.size - 4)
+        val n0inv = computeN0Inv(n0)
+
+        // R^2 mod n   (R = 2^(32*wordCount))
+        val bigN  = BigInteger(1, mod)
+        val R     = BigInteger.ONE.shiftLeft(32 * wordCount)
+        val R2modN = R.multiply(R).mod(bigN)
+        val rr    = normalizeToBE(R2modN.toByteArray(), mod.size)
+
+        // Serialize
+        val buf = ByteBuffer.allocate(4 + 4 + wordCount * 4 + wordCount * 4 + 4)
+            .order(ByteOrder.LITTLE_ENDIAN)
+        buf.putInt(wordCount)
+        buf.putInt(n0inv)
+
+        // Modulus: words in LE order, LSW first
+        for (i in wordCount - 1 downTo 0) {
+            buf.putInt(readInt32LE(mod, i * 4))
+        }
+        // R^2 mod n: same format
+        for (i in wordCount - 1 downTo 0) {
+            buf.putInt(readInt32LE(rr, i * 4))
+        }
+        buf.putInt(e)
+
+        val b64     = Base64.encodeToString(buf.array(), Base64.NO_WRAP)
+        val keyStr  = "$b64 keymousepro@android"
+        // ADB wire format must be null-terminated
+        return keyStr.toByteArray(Charsets.UTF_8) + byteArrayOf(0)
+    }
+
+    // ── Helpers ──
+
+    private fun readInt32LE(data: ByteArray, offset: Int): Int {
+        var v = 0
+        for (i in 0..3) {
+            v = v or ((data.getOrElse(offset + i) { 0 }.toInt() and 0xFF) shl (i * 8))
+        }
+        return v
+    }
+
+    /**
+     * Compute -(n^-1 mod 2^32) using Newton's method (5 iterations sufficient for 32-bit).
+     * Reference: adb_auth_host.cpp modular_inverse()
+     */
+    private fun computeN0Inv(n0: Int): Int {
+        var x = n0.toLong() and 0xFFFFFFFFL
+        // x_{n+1} = x_n * (2 - n0 * x_n) mod 2^32
+        repeat(5) {
+            x = (x * ((2L - (n0.toLong() and 0xFFFFFFFFL) * x) and 0xFFFFFFFFL)) and 0xFFFFFFFFL
+        }
+        return ((-x) and 0xFFFFFFFFL).toInt()
+    }
+
+    private fun normalizeToBE(src: ByteArray, targetLen: Int): ByteArray {
+        val stripped = if (src[0] == 0.toByte()) src.copyOfRange(1, src.size) else src
+        return when {
+            stripped.size == targetLen -> stripped
+            stripped.size <  targetLen -> ByteArray(targetLen - stripped.size) + stripped
+            else -> stripped.copyOfRange(stripped.size - targetLen, stripped.size)
+        }
+    }
+
+    private fun certFingerprint(cert: X509Certificate): String {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        return md.digest(cert.encoded).take(6).joinToString(":") { "%02X".format(it) } + "..."
+    }
+}
