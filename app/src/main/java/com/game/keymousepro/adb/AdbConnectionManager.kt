@@ -1,0 +1,395 @@
+// File: app/src/main/java/com/game/keymousepro/adb/AdbConnectionManager.kt
+package com.game.keymousepro.adb
+
+import android.content.Context
+import android.util.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.InputStream
+import java.io.OutputStream
+import java.net.InetSocketAddress
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.security.KeyStore
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
+import java.util.concurrent.atomic.AtomicBoolean
+import javax.net.ssl.*
+
+/**
+ * ADB connection over TLS 1.3 with mutual certificate authentication.
+ *
+ * This is the SECOND phase after pairing. Protocol:
+ *
+ *   ┌──────────┐                            ┌──────────────┐
+ *   │  Client  │                            │ adbd         │
+ *   │  (us)    │                            │ (device)     │
+ *   └────┬─────┘                            └──────┬───────┘
+ *        │  ─── TLS 1.3 connect to connect port ─► │
+ *        │  ◄──────── TLS handshake ──────────────► │
+ *        │       [adbd sends CertificateRequest]    │
+ *        │       [we present our EC P-256 cert]     │
+ *        │       [adbd verifies cert matches paired identity]
+ *        │                                          │
+ *        │  ──────── ADB CNXN message ──────────── ►│
+ *        │  ◄─────── CNXN (cert accepted)           │  ← success path
+ *        │   or ◄─── AUTH (TOKEN, 20 bytes)         │  ← fallback path
+ *        │  ─────── AUTH (SIGNATURE) ──────────────► │
+ *        │  ◄────── CNXN or AUTH(RSA_PUB_KEY req)   │
+ *        │                                          │
+ *        │  ──────── ADB OPEN shell: ─────────────► │
+ *        │  ◄──────── OKAY ─────────────────────── │
+ *        │  ◄──────── (bidirectional WRTE) ──────── │
+ *
+ * The EC P-256 cert presented here MUST be the same cert used during pairing.
+ * adbd authenticates by checking if the cert fingerprint is in its trusted list.
+ *
+ * References:
+ *   system/core/adb/adb.h (command definitions)
+ *   system/core/adb/transport.cpp (ADB over TLS)
+ *   system/core/adb/adb_auth.cpp (AUTH flow)
+ */
+class AdbConnectionManager(private val context: Context) {
+
+    companion object {
+        private const val TAG = "AdbConnectionManager"
+
+        // ADB command magic numbers (4-byte ASCII read as little-endian int)
+        private const val CMD_CNXN = 0x4e584e43  // "CNXN" LE = 0x43 0x4e 0x58 0x4e
+        private const val CMD_AUTH = 0x48545541  // "AUTH"
+        private const val CMD_OPEN = 0x4e45504f  // "OPEN"
+        private const val CMD_OKAY = 0x59414b4f  // "OKAY"
+        private const val CMD_CLSE = 0x45534c43  // "CLSE"
+        private const val CMD_WRTE = 0x45545257  // "WRTE"
+
+        // AUTH arg0 types
+        private const val AUTH_TOKEN      = 1
+        private const val AUTH_SIGNATURE  = 2
+        private const val AUTH_RSAPUBLICKEY = 3
+
+        private const val ADB_VERSION = 0x01000000
+        private const val MAX_DATA    = 256 * 1024  // 256 KB max payload
+
+        // ADB CNXN banner — must include features for shell_v2 (required for modern adbd)
+        private const val CONNECT_BANNER =
+            "host::features=shell_v2,cmd,stat_v2,ls_v2,fixed_push_mkdir,abb,abb_exec,remount_shell,track_app,sendrecv_v2,openscreen_mdns"
+    }
+
+    // ── State ──
+    @Volatile private var sslSocket: SSLSocket? = null
+    @Volatile private var inputStream: InputStream? = null
+    @Volatile private var outputStream: OutputStream? = null
+    private val _connected = AtomicBoolean(false)
+    private var localIdCounter = 1
+
+    // ── Shell stream (available after successful connection) ──
+    @Volatile var shellStream: AdbShellStream? = null
+        private set
+
+    // ── Callbacks ──
+    var onConnected: (() -> Unit)? = null
+    var onDisconnected: ((String) -> Unit)? = null
+
+    // ════════════════════════════════════════════════════════
+    //  Public API
+    // ════════════════════════════════════════════════════════
+
+    /**
+     * Connect to ADB via TLS 1.3.
+     *
+     * @param host  Device IP address
+     * @param port  Connection port from mDNS _adb-tls-connect._tcp
+     *              ⚠️ This is NOT the pairing port. Must be freshly discovered.
+     */
+    suspend fun connect(host: String, port: Int): Boolean = withContext(Dispatchers.IO) {
+        Log.d(TAG, "Connecting to ADB/TLS → $host:$port")
+        try {
+            doConnect(host, port)
+        } catch (e: Exception) {
+            Log.e(TAG, "Connect exception: ${e.javaClass.simpleName}: ${e.message}", e)
+            disconnect()
+            false
+        }
+    }
+
+    private fun doConnect(host: String, port: Int): Boolean {
+        // AUDIT CORRECTION: previously used a separate EC P-256 "TLS identity".
+        // AOSP uses ONE RSA-2048 keypair for everything. This MUST be the
+        // exact same identity (and thus the same X.509 cert) used during
+        // pairing — adbd checks the cert fingerprint against what it recorded
+        // when this device was paired.
+        val identity = AdbKeyPairGenerator.getOrCreateIdentity(context)
+
+        // ── TLS 1.3 with client certificate ──
+        val sslCtx = buildConnectionSslContext(identity.privateKey, identity.certificate)
+        val sock   = (sslCtx.socketFactory.createSocket() as SSLSocket).apply {
+            enabledProtocols = arrayOf("TLSv1.3")
+            connect(InetSocketAddress(host, port), 10_000)
+            soTimeout = 20_000
+        }
+
+        Log.d(TAG, "TCP connected, starting TLS handshake...")
+        sock.startHandshake()
+        Log.d(TAG, "TLS OK — Protocol=${sock.session.protocol}, Cipher=${sock.session.cipherSuite}")
+
+        sslSocket    = sock
+        inputStream  = sock.inputStream
+        outputStream = sock.outputStream
+
+        // ── ADB protocol handshake over TLS ──
+        val success = performAdbHandshake(inputStream!!, outputStream!!, identity)
+
+        if (success) {
+            sock.soTimeout = 0  // No timeout during normal operation
+            _connected.set(true)
+            openShellStream()
+            onConnected?.invoke()
+            Log.d(TAG, "✓ ADB/TLS connected and shell open")
+        }
+
+        return success
+    }
+
+    // ════════════════════════════════════════════════════════
+    //  ADB Handshake
+    // ════════════════════════════════════════════════════════
+
+    private fun performAdbHandshake(
+        ins: InputStream,
+        outs: OutputStream,
+        identity: AdbKeyPairGenerator.IdentityKeySet,
+    ): Boolean {
+        // Send our CNXN (introduce ourselves with feature list)
+        sendAdbMsg(outs, CMD_CNXN, ADB_VERSION, MAX_DATA,
+            CONNECT_BANNER.toByteArray(Charsets.UTF_8))
+        Log.d(TAG, "→ CNXN sent")
+
+        // Read first response
+        val msg1 = readAdbMsg(ins) ?: run {
+            Log.e(TAG, "No response after CNXN")
+            return false
+        }
+
+        return when (msg1.command) {
+            CMD_CNXN -> {
+                // adbd accepted our TLS certificate immediately.
+                // This is the expected path for Wireless Debugging after pairing.
+                val banner = String(msg1.data, Charsets.UTF_8)
+                Log.d(TAG, "✓ CNXN accepted. adbd banner: $banner")
+                true
+            }
+            CMD_AUTH -> {
+                // adbd wants RSA token-based auth (fallback path or first-time).
+                if (msg1.arg0 != AUTH_TOKEN) {
+                    Log.e(TAG, "Expected AUTH(TOKEN=1), got AUTH(${msg1.arg0})")
+                    return false
+                }
+                Log.d(TAG, "← AUTH(TOKEN) received, ${msg1.data.size} bytes")
+                handleAuthToken(msg1.data, ins, outs, identity)
+            }
+            else -> {
+                Log.e(TAG, "Unexpected first response: 0x${msg1.command.toString(16).uppercase()}")
+                false
+            }
+        }
+    }
+
+    private fun handleAuthToken(
+        token: ByteArray,
+        ins: InputStream,
+        outs: OutputStream,
+        identity: AdbKeyPairGenerator.IdentityKeySet,
+    ): Boolean {
+        // Sign the 20-byte token with RSA private key (SHA1withRSA).
+        // Verified against adb_auth.cpp: RSA_sign(NID_sha1, token, token_size, ...)
+        val signature = AdbKeyPairGenerator.signAdbToken(token, identity.privateKey)
+        sendAdbMsg(outs, CMD_AUTH, AUTH_SIGNATURE, 0, signature)
+        Log.d(TAG, "→ AUTH(SIGNATURE) sent")
+
+        val msg2 = readAdbMsg(ins) ?: run {
+            Log.e(TAG, "No response after AUTH(SIGNATURE)")
+            return false
+        }
+
+        return when {
+            msg2.command == CMD_CNXN -> {
+                Log.d(TAG, "✓ CNXN — RSA signature accepted")
+                true
+            }
+            msg2.command == CMD_AUTH && msg2.arg0 == AUTH_TOKEN -> {
+                // Signature rejected — device doesn't know our RSA key yet.
+                // Send our RSA public key and wait for user to tap "Allow" on device.
+                Log.d(TAG, "Signature rejected. Sending RSA public key for trust establishment...")
+                sendAdbMsg(outs, CMD_AUTH, AUTH_RSAPUBLICKEY, 0, identity.adbWireKey)
+                Log.d(TAG, "→ AUTH(RSAPUBLICKEY) sent — user must tap Allow on device")
+
+                // Wait up to 30 seconds for user interaction
+                sslSocket?.soTimeout = 30_000
+                val msg3 = readAdbMsg(ins)
+                sslSocket?.soTimeout = 20_000
+
+                when (msg3?.command) {
+                    CMD_CNXN -> {
+                        Log.d(TAG, "✓ CNXN — RSA public key trusted!")
+                        true
+                    }
+                    else -> {
+                        Log.e(TAG, "Trust rejected or timeout. Response: ${msg3?.command?.toString(16)}")
+                        false
+                    }
+                }
+            }
+            else -> {
+                Log.e(TAG, "Unexpected response to AUTH(SIGNATURE): 0x${msg2.command.toString(16)}")
+                false
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════
+    //  Shell Stream (OPEN / WRTE)
+    // ════════════════════════════════════════════════════════
+
+    private fun openShellStream() {
+        val outs = outputStream ?: return
+        val ins  = inputStream  ?: return
+        val myLocalId = localIdCounter++
+
+        // AUDIT FIX: confirmed from AOSP source (system/core/adb.c, A_OPEN handler):
+        //   name[p->msg.data_length > 0 ? p->msg.data_length - 1 : 0] = 0;
+        // adbd unconditionally overwrites the LAST received byte with a null
+        // terminator. Sending "shell:" (6 bytes, no null) causes adbd to
+        // overwrite the trailing ':' and corrupt the service name to "shell".
+        // The null terminator MUST be included in the payload we send.
+        sendAdbMsg(outs, CMD_OPEN, myLocalId, 0, "shell:\u0000".toByteArray(Charsets.UTF_8))
+        Log.d(TAG, "→ OPEN shell (localId=$myLocalId, payload includes null terminator)")
+
+        val resp = readAdbMsg(ins)
+        if (resp?.command == CMD_OKAY) {
+            val remoteId = resp.arg0
+            shellStream = AdbShellStream(
+                localId   = myLocalId,
+                remoteId  = remoteId,
+                writeMessage = { cmd, a0, a1, data -> sendAdbMsg(outs, cmd, a0, a1, data) }
+            )
+            Log.d(TAG, "✓ Shell stream open (remoteId=$remoteId)")
+        } else {
+            Log.e(TAG, "OPEN shell rejected: ${resp?.command?.toString(16)}")
+        }
+    }
+
+    // ════════════════════════════════════════════════════════
+    //  ADB Message I/O
+    // ════════════════════════════════════════════════════════
+
+    private data class AdbMsg(val command: Int, val arg0: Int, val arg1: Int, val data: ByteArray)
+
+    /**
+     * Send an ADB protocol message.
+     * Header: 24 bytes little-endian.
+     *   [command:4][arg0:4][arg1:4][data_len:4][checksum:4][magic:4]
+     * Then: [data: data_len bytes]
+     *
+     * magic = command XOR 0xFFFFFFFF (integrity check)
+     * checksum = sum of all data bytes
+     */
+    private fun sendAdbMsg(
+        out: OutputStream,
+        command: Int, arg0: Int, arg1: Int,
+        data: ByteArray? = null,
+    ) {
+        val dataLen  = data?.size ?: 0
+        val checksum = data?.fold(0) { acc, b -> acc + (b.toInt() and 0xFF) } ?: 0
+        val magic    = command xor -1  // = command XOR 0xFFFFFFFF
+
+        val header = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putInt(command); putInt(arg0); putInt(arg1)
+            putInt(dataLen); putInt(checksum); putInt(magic)
+        }.array()
+
+        synchronized(this) {
+            out.write(header)
+            if (data != null && data.isNotEmpty()) out.write(data)
+            out.flush()
+        }
+    }
+
+    /**
+     * Read one ADB protocol message from stream.
+     * Header: 24 bytes, then data_len bytes of payload.
+     */
+    private fun readAdbMsg(ins: InputStream): AdbMsg? {
+        return try {
+            val header = ins.readFully(24) ?: return null
+            val buf    = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN)
+            val command  = buf.int
+            val arg0     = buf.int
+            val arg1     = buf.int
+            val dataLen  = buf.int
+            buf.int  // checksum — skip
+            buf.int  // magic — skip
+
+            val data = if (dataLen > 0) ins.readFully(dataLen) ?: return null else ByteArray(0)
+            AdbMsg(command, arg0, arg1, data)
+        } catch (e: Exception) {
+            Log.e(TAG, "readAdbMsg error: ${e.message}")
+            null
+        }
+    }
+
+    private fun InputStream.readFully(n: Int): ByteArray? {
+        val buf = ByteArray(n)
+        var off = 0
+        while (off < n) {
+            val r = read(buf, off, n - off)
+            if (r == -1) return null
+            off += r
+        }
+        return buf
+    }
+
+    // ════════════════════════════════════════════════════════
+    //  TLS Setup for Connection Phase
+    // ════════════════════════════════════════════════════════
+
+    /**
+     * Build SSLContext for the connection phase:
+     *  - Present our EC P-256 cert (SAME cert from pairing — adbd verifies this)
+     *  - Trust all server certs (adbd's cert is self-signed)
+     */
+    private fun buildConnectionSslContext(
+        privateKey: java.security.PrivateKey,
+        certificate: X509Certificate,
+    ): SSLContext {
+        val ks = KeyStore.getInstance(KeyStore.getDefaultType())
+        ks.load(null)
+        ks.setKeyEntry("adb_ec_identity", privateKey, CharArray(0), arrayOf(certificate))
+
+        val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
+        kmf.init(ks, CharArray(0))
+
+        val trustAll = arrayOf<TrustManager>(object : X509TrustManager {
+            override fun checkClientTrusted(c: Array<X509Certificate>, a: String) {}
+            override fun checkServerTrusted(c: Array<X509Certificate>, a: String) {}
+            override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+        })
+
+        return SSLContext.getInstance("TLS").apply {
+            init(kmf.keyManagers, trustAll, SecureRandom())
+        }
+    }
+
+    // ════════════════════════════════════════════════════════
+    //  Lifecycle
+    // ════════════════════════════════════════════════════════
+
+    fun isConnected() = _connected.get()
+
+    fun disconnect() {
+        _connected.set(false)
+        shellStream = null
+        try { sslSocket?.close() } catch (_: Exception) {}
+        sslSocket = null; inputStream = null; outputStream = null
+        onDisconnected?.invoke("Disconnected")
+    }
+}

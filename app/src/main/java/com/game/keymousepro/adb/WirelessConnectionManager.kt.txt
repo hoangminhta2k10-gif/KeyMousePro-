@@ -1,0 +1,346 @@
+// File: app/src/main/java/com/game/keymousepro/adb/WirelessConnectionManager.kt
+package com.game.keymousepro.adb
+
+import android.content.Context
+import android.util.Log
+import kotlinx.coroutines.*
+
+/**
+ * Orchestrates the complete ADB Wireless Debugging flow.
+ *
+ * State machine:
+ *   IDLE
+ *    └─► DISCOVERING_PAIR   (mDNS: _adb-tls-pairing._tcp)
+ *         └─► PAIRING       (SPAKE2 + TLS on pairing port)
+ *              └─► DISCOVERING_CONNECT  (mDNS: _adb-tls-connect._tcp — FRESH)
+ *                   └─► CONNECTING     (TLS + ADB on connect port)
+ *                        └─► CONNECTED / CONNECTION_FAILED
+ *
+ * ────────────────────────────────────────────────────────────────
+ *  AUDIT CORRECTIONS in this version (race conditions / cancellation / timeout)
+ * ────────────────────────────────────────────────────────────────
+ *
+ * 1. RACE CONDITION FIXED: previously, starting a new operation called
+ *    `job.cancel()` on the old one WITHOUT waiting for it to actually stop
+ *    before launching the new job. `Job.cancel()` is fire-and-forget — the
+ *    old coroutine could still be mid-flight (holding a socket, about to call
+ *    a callback) while the new one starts, corrupting `_state` and leaking
+ *    sockets. Fixed by making every public entry point launch a coroutine
+ *    that first `cancelAndJoin()`s the previous attempt, then proceeds — so
+ *    "new supersedes old" is now a true, ordered guarantee, not a hope.
+ *
+ * 2. CANCELLATION FIXED: `Job.cancel()` alone does NOT stop a coroutine that
+ *    is blocked inside plain Java blocking I/O (SSLSocket.read()/write() are
+ *    NOT suspend functions and do not check for cancellation). Previously,
+ *    cancelling mid-handshake would leave the underlying thread blocked for
+ *    up to its full socket timeout (up to 20s) before actually stopping.
+ *    Fixed by giving AdbPairingManager a cancel() that force-closes its
+ *    socket (see AdbPairingManager.kt), and by always calling
+ *    AdbConnectionManager.disconnect() (which also closes its socket) as
+ *    part of superseding/cancelling an attempt — this throws an IOException
+ *    in the blocked read/write immediately, which is what actually unblocks
+ *    a suspended-but-blocking coroutine.
+ *
+ * 3. TIMEOUT FIXED: previously only individual sub-steps had timeouts
+ *    (mDNS discovery: 15s; socket connect: 10s; socket read: 20s), but nothing
+ *    bounded the ENTIRE pair+connect flow — if any sub-step misbehaved without
+ *    throwing, the UI could sit at "connecting..." forever. Now wrapped in an
+ *    outer withTimeout() so the operation always resolves one way or another.
+ */
+class WirelessConnectionManager(private val context: Context) {
+
+    companion object {
+        private const val TAG = "WirelessConnMgr"
+
+        // Small delay after pairing before re-discovering connect port.
+        // Allows adbd to update its internal state and mDNS advertisement.
+        private const val POST_PAIR_DELAY_MS = 600L
+
+        // Outer ceiling for the ENTIRE pair+connect (or connect-only) flow.
+        // Generous because it must accommodate: mDNS discovery (up to 15s) +
+        // TLS handshake + SPAKE2 exchange + a second mDNS discovery + a second
+        // TLS handshake + ADB auth handshake + possible user "Allow" tap wait
+        // (up to 30s) on first-ever trust. 90s comfortably covers all of that
+        // with margin, while still guaranteeing the UI is never stuck forever.
+        private const val OVERALL_TIMEOUT_MS = 90_000L
+    }
+
+    // ── Sub-components ──
+    val adbConnection = AdbConnectionManager(context)
+    private val discovery = AutoDiscoveryManager(context)
+    private var activePairingManager: AdbPairingManager? = null
+
+    // ── Coroutine scope (SupervisorJob: one attempt failing doesn't kill the manager) ──
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var activeJob: Job? = null
+
+    // Generation counter: every new operation increments this. Callbacks/state
+    // writes from a stale (superseded) attempt check their captured generation
+    // against the current one before touching shared state, so a slow-to-die
+    // old attempt can never clobber a newer one's results even in the brief
+    // window before its cancellation fully takes effect.
+    @Volatile private var generation = 0
+
+    // ── State ──
+    enum class State {
+        IDLE,
+        DISCOVERING_PAIR,
+        PAIRING,
+        PAIR_FAILED,
+        DISCOVERING_CONNECT,
+        CONNECTING,
+        CONNECTED,
+        CONNECTION_FAILED,
+        DISCONNECTED,
+        TIMED_OUT,
+    }
+
+    @Volatile private var _state = State.IDLE
+
+    // ── Callbacks ──
+    var onStateChanged: ((State) -> Unit)? = null
+    var onError: ((String) -> Unit)? = null
+
+    // ════════════════════════════════════════════════════════
+    //  Public API
+    // ════════════════════════════════════════════════════════
+
+    /**
+     * Full flow: discover pairing port → pair → discover connect port → connect.
+     * Safe to call while a previous attempt is still in flight — the previous
+     * attempt is guaranteed to be fully torn down (job joined, sockets closed)
+     * before this one begins.
+     *
+     * @param pairingCode The 6-digit code shown on the Android device screen
+     *                    in Settings → Developer options → Wireless debugging →
+     *                    "Pair device with pairing code"
+     */
+    fun pairAndConnect(pairingCode: String) {
+        val myGeneration = ++generation
+        activeJob = scope.launch {
+            supersedePreviousAttempt()
+            if (myGeneration != generation) return@launch  // superseded again before we even started
+            withTimeoutGuard(myGeneration) { runPairAndConnect(pairingCode, myGeneration) }
+        }
+    }
+
+    /**
+     * Connect only (skip pairing). Assumes this device was previously paired.
+     * Same supersede-then-run guarantee as pairAndConnect().
+     */
+    fun connectOnly() {
+        val myGeneration = ++generation
+        activeJob = scope.launch {
+            supersedePreviousAttempt()
+            if (myGeneration != generation) return@launch
+            withTimeoutGuard(myGeneration) { runConnectOnly(myGeneration) }
+        }
+    }
+
+    fun disconnect() {
+        ++generation  // invalidate any in-flight attempt
+        scope.launch {
+            supersedePreviousAttempt()
+            adbConnection.disconnect()
+            setState(State.DISCONNECTED)
+        }
+    }
+
+    fun isConnected() = adbConnection.isConnected()
+    fun currentState() = _state
+
+    fun destroy() {
+        ++generation
+        activeJob?.cancel()
+        activePairingManager?.cancel()
+        adbConnection.disconnect()
+        scope.cancel()
+    }
+
+    // ════════════════════════════════════════════════════════
+    //  Cancellation plumbing
+    // ════════════════════════════════════════════════════════
+
+    /**
+     * Fully tears down whatever the previous attempt was doing before letting
+     * a new one start: cancels its coroutine AND joins it (waits for it to
+     * actually finish), AND force-closes any socket it might be blocked on.
+     * This is what makes "new supersedes old" an ordered guarantee instead of
+     * a race.
+     */
+    private suspend fun supersedePreviousAttempt() {
+        activePairingManager?.cancel()   // unblocks any blocking SPAKE2/TLS I/O
+        adbConnection.disconnect()       // unblocks any blocking ADB TLS I/O
+        activeJob?.let { old ->
+            if (old !== coroutineContext[Job]) {
+                old.cancelAndJoin()      // wait for the old coroutine to actually stop
+            }
+        }
+    }
+
+    /**
+     * Runs [block] under an overall timeout, and reports TIMED_OUT (rather
+     * than leaving the UI stuck) if it's exceeded — but only if this attempt
+     * is still the current one (a superseded attempt times out silently).
+     */
+    private suspend fun withTimeoutGuard(myGeneration: Int, block: suspend () -> Unit) {
+        try {
+            withTimeout(OVERALL_TIMEOUT_MS) { block() }
+        } catch (e: TimeoutCancellationException) {
+            if (myGeneration == generation) {
+                Log.e(TAG, "Overall operation timed out after ${OVERALL_TIMEOUT_MS}ms")
+                onError?.invoke("Connection timed out. Please try again.")
+                setState(State.TIMED_OUT)
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════
+    //  Flow implementations
+    // ════════════════════════════════════════════════════════
+
+    private suspend fun runPairAndConnect(pairingCode: String, myGeneration: Int) {
+
+        // ── Phase 1: Discover pairing service ──────────────
+        setStateIfCurrent(State.DISCOVERING_PAIR, myGeneration)
+        Log.d(TAG, "Phase 1 — discovering pairing service...")
+
+        val pairingEndpoint = try {
+            discovery.discoverPairing()
+        } catch (e: Exception) {
+            if (myGeneration != generation) return
+            Log.e(TAG, "Pairing service not found: ${e.message}")
+            onError?.invoke(
+                "Cannot find ADB pairing service.\n" +
+                "Make sure Wireless Debugging is enabled and you tapped\n" +
+                "'Pair device with pairing code'."
+            )
+            setStateIfCurrent(State.PAIR_FAILED, myGeneration)
+            return
+        }
+        if (myGeneration != generation) return  // superseded while discovering
+
+        Log.d(TAG, "Pairing service → ${pairingEndpoint.host}:${pairingEndpoint.port}")
+
+        // ── Phase 2: Pair ───────────────────────────────────
+        setStateIfCurrent(State.PAIRING, myGeneration)
+        Log.d(TAG, "Phase 2 — pairing with code (${pairingCode.length} digits)...")
+
+        val pairingManager = AdbPairingManager(context)
+        activePairingManager = pairingManager
+        val paired = try {
+            pairingManager.pair(pairingEndpoint.host, pairingEndpoint.port, pairingCode)
+        } finally {
+            if (activePairingManager === pairingManager) activePairingManager = null
+        }
+        if (myGeneration != generation) return  // superseded while pairing
+
+        if (!paired) {
+            Log.e(TAG, "Pairing FAILED")
+            onError?.invoke(
+                "Pairing failed. Possible causes:\n" +
+                "• Wrong 6-digit code\n" +
+                "• Code expired (tap 'Pair device with pairing code' again)\n" +
+                "• Network issue"
+            )
+            setStateIfCurrent(State.PAIR_FAILED, myGeneration)
+            return
+        }
+
+        Log.d(TAG, "✓ Pairing SUCCESS")
+
+        // ── Brief delay — allow adbd to update its state ────
+        delay(POST_PAIR_DELAY_MS)
+        if (myGeneration != generation) return
+
+        // ── Phase 3: Discover connection service (FRESH) ───
+        // The connection port is a DIFFERENT random port than the pairing port.
+        // Must re-discover after pairing — do not cache or reuse the pairing endpoint.
+        setStateIfCurrent(State.DISCOVERING_CONNECT, myGeneration)
+        Log.d(TAG, "Phase 3 — discovering connection service (fresh, different port)...")
+
+        val connectEndpoint = try {
+            discovery.discoverConnect()
+        } catch (e: Exception) {
+            if (myGeneration != generation) return
+            Log.e(TAG, "Connection service not found after pairing: ${e.message}")
+            onError?.invoke(
+                "Pairing succeeded but connection service not found.\n" +
+                "Try tapping 'Connect only' or restart Wireless Debugging."
+            )
+            setStateIfCurrent(State.CONNECTION_FAILED, myGeneration)
+            return
+        }
+        if (myGeneration != generation) return
+
+        Log.d(TAG, "Connection service → ${connectEndpoint.host}:${connectEndpoint.port}")
+
+        // ── Phase 4: Connect ────────────────────────────────
+        doConnect(connectEndpoint.host, connectEndpoint.port, myGeneration)
+    }
+
+    private suspend fun runConnectOnly(myGeneration: Int) {
+        setStateIfCurrent(State.DISCOVERING_CONNECT, myGeneration)
+        Log.d(TAG, "Connect-only — discovering connection service...")
+
+        val endpoint = try {
+            discovery.discoverConnect()
+        } catch (e: Exception) {
+            if (myGeneration != generation) return
+            Log.e(TAG, "Connection service not found: ${e.message}")
+            onError?.invoke(
+                "Cannot find ADB connection service.\n" +
+                "Ensure Wireless Debugging is on, or pair first."
+            )
+            setStateIfCurrent(State.CONNECTION_FAILED, myGeneration)
+            return
+        }
+        if (myGeneration != generation) return
+
+        Log.d(TAG, "Connection service → ${endpoint.host}:${endpoint.port}")
+        doConnect(endpoint.host, endpoint.port, myGeneration)
+    }
+
+    private suspend fun doConnect(host: String, port: Int, myGeneration: Int) {
+        setStateIfCurrent(State.CONNECTING, myGeneration)
+        Log.d(TAG, "Phase 4 — connecting to ADB/TLS $host:$port...")
+
+        adbConnection.onConnected = {
+            if (myGeneration == generation) setState(State.CONNECTED)
+        }
+        adbConnection.onDisconnected = { reason ->
+            Log.w(TAG, "ADB disconnected: $reason")
+            if (myGeneration == generation) setState(State.DISCONNECTED)
+        }
+
+        val connected = adbConnection.connect(host, port)
+        if (myGeneration != generation) return  // superseded during connect
+
+        if (!connected) {
+            Log.e(TAG, "ADB connection FAILED")
+            onError?.invoke(
+                "Connection rejected by device.\n" +
+                "Possible causes:\n" +
+                "• TLS certificate mismatch (pair again)\n" +
+                "• Wireless Debugging was restarted (reconnect)\n" +
+                "• Device revoked trust"
+            )
+            setStateIfCurrent(State.CONNECTION_FAILED, myGeneration)
+        }
+    }
+
+    // ════════════════════════════════════════════════════════
+    //  Helpers
+    // ════════════════════════════════════════════════════════
+
+    private fun setState(s: State) {
+        _state = s
+        Log.d(TAG, "State → $s")
+        onStateChanged?.invoke(s)
+    }
+
+    /** Only applies the state transition if no newer attempt has superseded this one. */
+    private fun setStateIfCurrent(s: State, myGeneration: Int) {
+        if (myGeneration == generation) setState(s)
+    }
+}

@@ -1,0 +1,200 @@
+// File: app/src/main/java/com/game/keymousepro/adb/AutoDiscoveryManager.kt
+package com.game.keymousepro.adb
+
+import android.content.Context
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
+import android.util.Log
+import kotlinx.coroutines.CancellableContinuation
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeout
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+
+/**
+ * mDNS discovery for ADB Wireless Debugging services.
+ *
+ * ADB Wireless Debugging (Android 11+) advertises exactly two mDNS services:
+ *
+ *   _adb-tls-pairing._tcp  — Pairing port (for SPAKE2 pairing with 6-digit code)
+ *   _adb-tls-connect._tcp  — Connection port (for post-pairing ADB connections)
+ *
+ * CRITICAL TIMING REQUIREMENT:
+ *   These are DIFFERENT random ports. After pairing:
+ *   - Do NOT reuse the pairing port for connection.
+ *   - Do NOT use port 5555 as fallback (that is classic ADB, not Wireless Debugging).
+ *   - MUST perform fresh discovery of _adb-tls-connect._tcp AFTER pairing completes.
+ *
+ * The device may update its mDNS advertisement after pairing (e.g. adding
+ * the new trusted client to its announcements). Waiting ~500ms after pairing
+ * before re-discovering is recommended.
+ */
+class AutoDiscoveryManager(private val context: Context) {
+
+    companion object {
+        private const val TAG = "AutoDiscoveryManager"
+
+        /** mDNS service type for the pairing phase */
+        const val TYPE_PAIRING = "_adb-tls-pairing._tcp"
+
+        /** mDNS service type for the connection phase (post-pairing) */
+        const val TYPE_CONNECT = "_adb-tls-connect._tcp"
+
+        private const val DISCOVERY_TIMEOUT_MS  = 15_000L
+    }
+
+    data class Endpoint(val host: String, val port: Int, val serviceName: String)
+
+    private val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
+
+    // ════════════════════════════════════════════════════════
+    //  Public API
+    // ════════════════════════════════════════════════════════
+
+    /**
+     * Discover the ADB pairing service.
+     * Call this FIRST, before pairing.
+     *
+     * @throws Exception if no service found within 15 seconds
+     */
+    suspend fun discoverPairing(): Endpoint {
+        Log.d(TAG, "Discovering pairing service ($TYPE_PAIRING)...")
+        return withTimeout(DISCOVERY_TIMEOUT_MS) {
+            discoverFirst(TYPE_PAIRING)
+        }
+    }
+
+    /**
+     * Discover the ADB connection service.
+     * Call this AFTER pairing is complete.
+     *
+     * The connection port is DIFFERENT from the pairing port.
+     * This discovery must be fresh (not cached from before pairing).
+     *
+     * @throws Exception if no service found within 15 seconds
+     */
+    suspend fun discoverConnect(): Endpoint {
+        Log.d(TAG, "Discovering connection service ($TYPE_CONNECT)...")
+        return withTimeout(DISCOVERY_TIMEOUT_MS) {
+            discoverFirst(TYPE_CONNECT)
+        }
+    }
+
+    // ════════════════════════════════════════════════════════
+    //  Core discovery logic
+    // ════════════════════════════════════════════════════════
+
+    /**
+     * Discover the first instance of a given service type.
+     *
+     * Uses Android NsdManager (mDNS / DNS-SD). The NsdManager callback
+     * is bridged to a coroutine via suspendCancellableCoroutine.
+     *
+     * Android NsdManager quirks:
+     *   - May find the same service multiple times
+     *   - Resolve must be called for each found service (not batched)
+     *   - stopServiceDiscovery MUST be called or discovery leaks
+     */
+    private suspend fun discoverFirst(serviceType: String): Endpoint =
+        suspendCancellableCoroutine { cont ->
+            @Volatile var discoveryListener: NsdManager.DiscoveryListener? = null
+            @Volatile var resolveInProgress = false
+
+            discoveryListener = object : NsdManager.DiscoveryListener {
+
+                override fun onStartDiscoveryFailed(type: String, errorCode: Int) {
+                    Log.e(TAG, "Discovery start FAILED for $type: error=$errorCode")
+                    cont.safeResumeWithException(
+                        Exception("NsdManager.discoverServices failed: error code $errorCode")
+                    )
+                }
+
+                override fun onStopDiscoveryFailed(type: String, errorCode: Int) {
+                    Log.w(TAG, "Discovery stop failed for $type: error=$errorCode")
+                }
+
+                override fun onDiscoveryStarted(type: String) {
+                    Log.d(TAG, "Discovery started for $type")
+                }
+
+                override fun onDiscoveryStopped(type: String) {
+                    Log.d(TAG, "Discovery stopped for $type")
+                }
+
+                override fun onServiceFound(info: NsdServiceInfo) {
+                    Log.d(TAG, "Service FOUND: name=${info.serviceName} type=${info.serviceType}")
+
+                    // Only attempt one resolve at a time to avoid NsdManager internal errors
+                    if (resolveInProgress) return
+                    resolveInProgress = true
+
+                    nsdManager.resolveService(info, object : NsdManager.ResolveListener {
+
+                        override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {
+                            Log.w(TAG, "Resolve FAILED for ${info.serviceName}: error=$errorCode")
+                            resolveInProgress = false  // Allow retry on next onServiceFound
+                        }
+
+                        override fun onServiceResolved(resolved: NsdServiceInfo) {
+                            val host = resolved.host?.hostAddress
+                            val port = resolved.port
+
+                            if (host == null || port <= 0) {
+                                Log.w(TAG, "Resolved service has no host/port: host=$host port=$port")
+                                resolveInProgress = false
+                                return
+                            }
+
+                            Log.d(TAG, "Service RESOLVED: ${resolved.serviceName} → $host:$port")
+
+                            // Stop discovery to release resources
+                            discoveryListener?.let {
+                                try { nsdManager.stopServiceDiscovery(it) }
+                                catch (_: Exception) {}
+                            }
+
+                            cont.safeResume(Endpoint(host, port, resolved.serviceName))
+                        }
+                    })
+                }
+
+                override fun onServiceLost(info: NsdServiceInfo) {
+                    Log.w(TAG, "Service LOST: ${info.serviceName}")
+                    // If we were resolving this service, we'll try the next one that appears
+                }
+            }
+
+            // Start discovery
+            try {
+                nsdManager.discoverServices(
+                    serviceType,
+                    NsdManager.PROTOCOL_DNS_SD,
+                    discoveryListener
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "discoverServices() threw: ${e.message}")
+                cont.safeResumeWithException(e)
+                return@suspendCancellableCoroutine
+            }
+
+            // Stop discovery if the coroutine is cancelled (timeout or external cancel)
+            cont.invokeOnCancellation {
+                discoveryListener?.let {
+                    try { nsdManager.stopServiceDiscovery(it) }
+                    catch (_: Exception) {}
+                }
+            }
+        }
+
+    // ════════════════════════════════════════════════════════
+    //  Helpers
+    // ════════════════════════════════════════════════════════
+
+    private fun <T> CancellableContinuation<T>.safeResume(value: T) {
+        if (isActive) resume(value)
+    }
+
+    private fun <T> CancellableContinuation<T>.safeResumeWithException(e: Throwable) {
+        if (isActive) resumeWithException(e)
+    }
+}
